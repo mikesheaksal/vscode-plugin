@@ -9,8 +9,9 @@ A VS Code extension that connects to a backend and does two things:
 
 1. **Alerts.** The server pushes an alert; the extension shows it to the user with one or
    two action buttons; the user's choice (or dismissal) is posted back to the server.
-2. **Form.** A persistent button in the VS Code chrome opens a panel with a small fixed
-   set of fields plus Submit/Cancel; the submitted payload is posted to the server.
+2. **Form.** A permanent icon in the Activity Bar opens a sidebar containing a form with
+   a small fixed set of fields plus Submit/Cancel; the submitted payload is posted to the
+   server.
 
 Everything else in this document exists to make those two flows reliable when the
 network drops, the token expires, or the user has six windows open.
@@ -23,37 +24,95 @@ network drops, the token expires, or the user has six windows open.
 | Server → client transport | **SSE**, long-poll fallback | Push latency without a WebSocket; survives most corporate proxies |
 | Form fields | **Hardcoded** in the extension | Simple and type-safe; field changes require a new release |
 | Auth | **API token from settings**, fallback to a known local file | No IdP work; token handling needs care (§6) |
+| Entry point | **Activity Bar container** with a form view and an alerts view | Permanent icon in the left strip; form is one click away (§3) |
 
 Open items are listed in §12.
 
-## 3. The "toolbar button" — what that actually means in VS Code
+## 3. The "toolbar button" — the Activity Bar
 
-VS Code has no classic toolbar to add a button to. The realistic homes for a global,
-always-available action are:
+VS Code's equivalent of a toolbar is the **Activity Bar**: the vertical icon strip on the
+left edge holding Explorer, Search, Source Control and so on. An extension can contribute
+its own icon there, and clicking it opens a dedicated sidebar. Since the form is a primary
+user-facing feature rather than an occasional utility, that is the placement we take.
 
-| Surface | Always visible | Notes |
-|---|---|---|
-| **Status bar item** (bottom bar) | Yes | Closest thing to a toolbar button; can carry a pending-alert count |
-| Editor title bar icon (`menus: editor/title`) | Only with a file open | Good secondary placement |
-| Activity bar view container | Yes, but costs a whole sidebar slot | Overkill for one form |
-| Command Palette entry | On demand | Free, always add it |
+### 3.1 What we contribute
 
-**Proposal:** a status bar item (`$(bell) Alerts`) as the primary entry point, plus a
-Command Palette command (`Acme Alerts: Open Form`) and an optional editor-title icon.
-The status bar item doubles as the unread indicator: `$(bell) Alerts` normally,
-`$(bell-dot) Alerts 3` with a warning background when alerts are pending.
+```jsonc
+"contributes": {
+  "viewsContainers": {
+    "activitybar": [
+      { "id": "acmeAlerts", "title": "Alerts", "icon": "media/activity-bar.svg" }
+    ]
+  },
+  "views": {
+    "acmeAlerts": [
+      { "id": "acmeAlerts.form",    "name": "New Request", "type": "webview" },
+      { "id": "acmeAlerts.pending", "name": "Alerts",      "type": "tree"    }
+    ]
+  }
+}
+```
 
-Flagging this early because "button on toolbar" maps to a status bar item, which sits at
-the *bottom* of the window, not the top. If a top-of-window placement is a hard
-requirement, the editor title bar is the only option and it disappears when no editor is
-open.
+Two views inside one container:
+
+- **`acmeAlerts.form`** — a `WebviewView` rendering the form *inside the sidebar*. One
+  click on the Activity Bar icon and the user is looking at the form; there is no
+  intermediate panel to open. This is the primary surface.
+- **`acmeAlerts.pending`** — a `TreeView` listing outstanding and recently answered
+  alerts. This is not decoration: it is what makes alerts recoverable when a notification
+  is missed or auto-dismissed, and it replaces the QuickPick workaround for alert bursts
+  (§7.3).
+
+The Activity Bar icon must be a monochrome 24×24 SVG drawn with `currentColor`, or VS Code
+will not theme it correctly.
+
+### 3.2 The unread badge
+
+A `TreeView` exposes `view.badge = { value: n, tooltip: '3 alerts awaiting response' }`,
+which VS Code renders as a native numeric badge on the Activity Bar icon — the same
+treatment Source Control uses for pending changes. This is a better unread indicator than
+anything we could build in the status bar, and it is one line of code.
+
+### 3.3 Empty and signed-out states
+
+`contributes.viewsWelcome` fills a view before it has content, with markdown plus command
+buttons. Two states worth authoring:
+
+- No token configured → "Sign in to start receiving alerts" with a `[Sign In]` button
+  bound to `acmeAlerts.signIn`.
+- Connected, nothing pending → "No alerts. You're all caught up."
+
+This turns the first-run experience into something self-explanatory instead of an empty
+grey rectangle.
+
+### 3.4 Secondary entry points
+
+- Command Palette: `Acme Alerts: New Request`, `Acme Alerts: Sign In`,
+  `Acme Alerts: Show Log`. Free, and how power users will actually reach the feature.
+- View title bar buttons (`menus: view/title`): refresh, and "Open in Editor" (§8.2).
+- A status bar item is **no longer needed** for the unread count — the Activity Bar badge
+  covers it. Optional later if we want a persistent connection-status indicator.
+
+### 3.5 Cost of this choice
+
+The Activity Bar container takes a permanent slot in every user's window, whether or not
+they have anything pending. For a feature users are expected to interact with regularly
+that is the right trade; for a rarely-used utility it would be intrusive. Users who
+disagree can hide it via right-click → Hide, so the escape hatch exists.
+
+### 3.6 The narrow-width constraint
+
+The sidebar defaults to roughly 300px. A handful of stacked fields fits comfortably; a
+long free-text field is cramped. The design accounts for this with a single-column layout
+that degrades gracefully, and an "Open in Editor" action that reopens the same form as a
+full-width editor panel (§8.2).
 
 ## 4. Architecture
 
 ```
 ┌──────────────────────── VS Code extension host (Node) ────────────────────────┐
 │                                                                               │
-│  extension.ts  ── activation, command + status bar registration, disposal     │
+│  extension.ts  ── activation, command + view provider registration, disposal  │
 │        │                                                                      │
 │        ├── ConfigService      settings, token resolution, change watching     │
 │        ├── ApiClient          fetch wrapper: auth header, retry, error map    │
@@ -61,8 +120,10 @@ open.
 │        │        │                                                             │
 │        │        └──> AlertService   dedupe → showInformationMessage → respond │
 │        │                                                                      │
-│        ├── FormPanel          singleton webview, draft persistence            │
+│        ├── FormViewProvider   WebviewView in the sidebar (primary surface)    │
+│        │   FormPanel          same form as an editor panel ("Open in Editor")  │
 │        │        └── webview/  index.html + form.js + form.css (CSP, nonce)    │
+│        ├── AlertTreeProvider  pending/recent alerts + Activity Bar badge       │
 │        │                                                                      │
 │        ├── Outbox             durable queue of unsent responses/submissions   │
 │        └── Logger             OutputChannel "Acme Alerts"                     │
@@ -80,8 +141,8 @@ open.
 
 Module boundaries matter for one practical reason: `ApiClient`, `EventStream`, `Outbox`
 and validation must be unit-testable without a running VS Code, so nothing in them may
-import `vscode`. Only `extension.ts`, `AlertService`, `FormPanel` and `ConfigService`
-touch the VS Code API.
+import `vscode`. Only `extension.ts`, `AlertService`, the view
+providers and `ConfigService` touch the VS Code API.
 
 ## 5. Wire protocol
 
@@ -193,8 +254,8 @@ accident when placed in `.vscode/settings.json`. So:
 
 On `401`: drop the cached token, re-resolve from scratch (the file may have been
 refreshed by an external tool), retry the request exactly once. If it fails again, stop
-the reconnect loop, set the status bar to `$(bell-slash) Alerts — sign in`, and show one
-notification with a "Sign In" button. Do not loop on a bad token.
+the reconnect loop, switch both views to their signed-out `viewsWelcome` state (§3.3), and
+show one notification with a "Sign In" button. Do not loop on a bad token.
 
 ## 7. Alert delivery
 
@@ -239,42 +300,90 @@ Two behaviours worth knowing, because they shape the UX:
   `undefined` on dismissal. **There is no API to close a notification programmatically.**
   This matters in §9.3.
 
-### 7.3 Alert bursts
+### 7.3 Alert bursts, and the alerts view
 
 Ten alerts at once produce ten stacked notifications, and the user will miss most of them.
-Mitigation: if more than 3 alerts are outstanding, stop showing individual notifications
-and switch to a single "N alerts pending" notification whose button opens a QuickPick
-list of them. The status bar count is the always-on indicator.
+The `acmeAlerts.pending` tree view is the answer: notifications become the *fast path*,
+and the view is the durable record.
+
+- Every incoming alert is added to the view, whether or not its notification is seen.
+- If more than 3 alerts are outstanding, individual notifications stop and a single
+  "N alerts pending" notification appears, whose button reveals the view
+  (`vscode.commands.executeCommand('acmeAlerts.pending.focus')`).
+- Selecting an alert in the view re-presents it — as a modal dialog for a definitive
+  answer, since the original notification cannot be reopened.
+- Each tree item carries inline action buttons (`menus: view/item/context`,
+  `group: "inline"`) for the alert's one or two responses, so the common case is answered
+  in one click without opening anything.
+- Answered alerts stay in a collapsed "Recent" node for the session, dimmed with the
+  chosen response in the item description.
+
+This also fixes the ghost-notification problem from §9.3 in the direction that matters: a
+duplicate notification in another window cannot be closed, but the *view* in every window
+reflects true state on the next event.
 
 ## 8. The form
 
-- A single webview panel (`vscode.window.createWebviewPanel`), **singleton** — a second
-  invocation calls `panel.reveal()` instead of opening a duplicate.
-- Fields are hardcoded in one module (`form/fields.ts`) as a typed const, so the webview
-  renderer, the validator, and the request body all derive from one source. Even in the
-  hardcoded design, having a single declaration is what makes a later server-driven schema
-  a contained change rather than a rewrite.
-- Rendering: plain HTML using `var(--vscode-*)` CSS variables so it matches the user's
-  theme, light/dark/high-contrast, for free. No UI framework — the form is small enough
-  that React would be more build tooling than payoff.
+### 8.1 Primary surface: a WebviewView in the sidebar
+
+Registered with `vscode.window.registerWebviewViewProvider('acmeAlerts.form', provider,
+{ webviewOptions: { retainContextWhenHidden: false } })`.
+
+The important behavioural difference from a webview panel: **a `WebviewView` is torn down
+when hidden** — when the user collapses it or switches to another Activity Bar container —
+and `resolveWebviewView` runs again on return. We deliberately leave
+`retainContextWhenHidden` off rather than pinning the webview in memory for the whole
+session; the draft-persistence mechanism below already makes teardown invisible to the
+user, and it is the same mechanism we need for a window reload anyway. One state
+mechanism, not two.
+
+- Fields are hardcoded in one module (`form/fields.ts`) as a typed const, so the renderer,
+  the validator and the request body all derive from a single declaration. Even in a
+  hardcoded design this is what keeps a later server-driven schema a contained change
+  rather than a rewrite.
+- Rendering: plain HTML using `var(--vscode-*)` CSS variables — specifically the
+  `--vscode-sideBar-*` and `--vscode-input-*` families — so it matches the user's theme in
+  light, dark and high-contrast for free. No UI framework; the form is small enough that
+  React would be more build tooling than payoff.
+- Layout is single-column and fluid, with no fixed pixel widths, so it survives the
+  sidebar being dragged narrow. Labels sit above inputs rather than beside them.
 - CSP: `default-src 'none'; style-src ${webview.cspSource}; script-src 'nonce-${nonce}';`
-  with `localResourceRoots` limited to the `media/` folder.
+  with `localResourceRoots` limited to `media/`.
 - Message protocol:
   - webview → extension: `{ type: 'submit', payload }`, `{ type: 'draft', payload }`,
     `{ type: 'cancel' }`
   - extension → webview: `{ type: 'init', draft }`, `{ type: 'busy', value }`,
     `{ type: 'result', ok, error? }`
-- **Drafts:** instead of `retainContextWhenHidden` (which keeps the whole webview alive in
-  memory), the webview posts a debounced `draft` message on every change; the extension
-  stores it in `workspaceState` and restores it in `init`. Closing the panel mid-form and
-  reopening it does not lose typing.
-- **Validation runs twice:** in the webview for immediate feedback (disable Submit, inline
-  messages), and again in the extension before the POST, because the webview is not a
-  trustworthy source. The server validates a third time and is authoritative.
-- Submit flow: disable the form → POST with an `Idempotency-Key` generated once per
-  submission attempt → on success, clear draft, close panel, show a confirmation
-  notification → on failure, re-enable the form with the error inline and offer to queue
-  it in the outbox.
+
+### 8.2 "Open in Editor"
+
+A button in the view title bar reopens the same form as a full-width
+`WebviewPanel` in the editor area, for users who want room to write. The two hosts share
+one HTML generator, one message handler and one draft — only the shell differs, so this
+costs well under a hundred lines. The draft transfers, so the switch is seamless
+mid-typing.
+
+### 8.3 Draft persistence
+
+The webview posts a debounced `draft` message on every change; the extension stores it in
+`workspaceState` and replays it in `init`. This covers all four ways the form can go away:
+collapsing the view, switching Activity Bar containers, closing the editor panel, and
+reloading the window.
+
+### 8.4 Validation and submit
+
+**Validation runs twice on the client:** in the webview for immediate feedback (disabled
+Submit, inline messages), and again in the extension before the POST, because a webview is
+not a trustworthy input source. The server validates a third time and is authoritative.
+
+Submit flow: disable the form → POST with an `Idempotency-Key` generated once per
+submission attempt → on success clear the draft, reset the form, show a confirmation
+notification with an "Open" button linking to the created record → on failure re-enable
+the form with the error shown inline and offer to queue it in the outbox.
+
+Note the difference from the old panel design: on success the sidebar view **resets in
+place** rather than closing, because there is nothing to close. That is a better outcome —
+the user sees an empty ready form rather than a disappearing panel.
 
 ## 9. Reliability
 
@@ -309,8 +418,10 @@ connections for one user, and the same alert shown N times. Options:
    global storage path) and is the only one that connects. Clean UX, but lock handoff on
    crash is fiddly and it is the classic source of "no alerts at all" bugs.
 
-**Recommendation: option 1** for v1, with the `409` path implemented properly. Revisit if
-users complain about ghost notifications.
+**Recommendation: option 1** for v1, with the `409` path implemented properly. The alerts
+tree view (§7.3) softens this considerably: even if a stale notification lingers in
+another window, that window's view shows the alert as answered on the next event, so the
+user always has one place showing the truth.
 
 ### 9.4 Remote development
 
@@ -326,14 +437,14 @@ Each phase is independently demoable. Phases 3–5 assume the mock server from P
 | # | Phase | Deliverable | Done when |
 |---|---|---|---|
 | 0 | Contract | This document + an OpenAPI file agreed with the backend team | Both sides sign off on §5 |
-| 1 | Skeleton | `yo code` scaffold, TS strict, ESLint, `onStartupFinished` activation, status bar item, output channel, settings contributed | F5 opens a dev host showing the status bar item; clicking it logs |
+| 1 | Skeleton | `yo code` scaffold, TS strict, ESLint, `onStartupFinished` activation, Activity Bar container + icon, placeholder views, output channel, settings contributed | F5 opens a dev host; the Activity Bar icon appears and opens a sidebar with both views |
 | 2 | Config & auth | `ConfigService` with the three-source resolution, SecretStorage migration, Sign In command, redacting logger | Unit tests cover all three sources + precedence + 401 invalidation |
 | 3 | API client + mock | `ApiClient` (auth, timeout, retry, typed errors) and a ~150-line Express mock server with a CLI to push alerts | `GET /me` succeeds against the mock; every error code maps correctly |
-| 4 | Alerts via polling | `AlertService`: catch-up poll, notification with 1–2 buttons, response POST, dedupe set | Push an alert from the mock CLI → notification appears → server records the answer |
+| 4 | Alerts via polling | `AlertService`: catch-up poll, notification with 1–2 buttons, response POST, dedupe set; `AlertTreeProvider` with inline action buttons, badge and welcome states | Push an alert from the mock CLI → it appears in both the notification and the view, badge increments, answering either way records once |
 | 5 | SSE | `EventStream`: hand-rolled parser, heartbeat, jittered backoff, `Last-Event-ID` resume, long-poll fallback | Kill the mock mid-stream → client reconnects and receives an alert queued during the outage |
-| 6 | Form | Webview panel, hardcoded fields, CSP + nonce, theme variables, validation, submit | Open from status bar → fill → submit → mock records the payload; invalid input blocks Submit |
-| 7 | Reliability | Outbox, draft persistence, alert-burst coalescing, 409 handling | Submit with the mock stopped → restart mock → submission arrives exactly once |
-| 8 | Tests | Unit (parser, backoff, token resolution, outbox, validation) + `@vscode/test-electron` integration (commands registered, panel opens) + manual matrix | CI green on Linux/macOS/Windows |
+| 6 | Form | `WebviewView` in the sidebar, hardcoded fields, CSP + nonce, theme variables, validation, submit, "Open in Editor" panel sharing the same code | Open from the Activity Bar → fill → submit → mock records the payload; invalid input blocks Submit; collapsing the view and returning preserves the draft |
+| 7 | Reliability | Outbox, draft persistence, alert-burst coalescing, 409 handling | Submit with the mock stopped → restart mock → submission arrives exactly once; 10 alerts at once produce one notification and 10 view entries |
+| 8 | Tests | Unit (parser, backoff, token resolution, outbox, validation) + `@vscode/test-electron` integration (commands registered, view container resolves, webview view renders) + manual matrix incl. a narrow sidebar and high-contrast theme | CI green on Linux/macOS/Windows |
 | 9 | Packaging | `vsce package`, README, CHANGELOG, icon, telemetry opt-out honoured | A `.vsix` installs cleanly on a machine that never had the dev setup |
 | 10 | Ops | Structured logs, a "Report Issue" command that dumps redacted diagnostics, version pinning between client and server | Support can diagnose a user issue from one pasted log |
 
@@ -345,10 +456,12 @@ conditions.
 
 | Risk | Impact | Mitigation |
 |---|---|---|
-| "Toolbar" expectation vs. status bar reality | UX surprise at demo | Settled in §3 before any code |
+| Activity Bar slot is intrusive for low-frequency users | Users hide the container and stop seeing alerts | Notifications remain the primary alert channel and work with the container hidden (§3.5) |
+| Sidebar too narrow for comfortable typing | Users avoid the form | Fluid single-column layout plus "Open in Editor" (§8.2) |
+| `WebviewView` torn down when hidden | Lost input, reported as a data-loss bug | Draft persistence on every change, tested explicitly in Phase 6 (§8.3) |
 | Corporate proxy buffers SSE | Alerts arrive minutes late or never | Correct response headers; long-poll fallback; test behind the real proxy in Phase 5 |
 | Token in `settings.json` leaks via Settings Sync or a commit | Credential exposure | Application-scoped setting, SecretStorage migration, redacting logger (§6.2) |
-| Notification bursts | Users miss alerts | Coalescing + status bar count (§7.3) |
+| Notification bursts | Users miss alerts | Coalescing into one notification + the alerts view and its badge (§7.3) |
 | Duplicate alerts across windows | Ghost notifications | Dedupe + `409` handling (§9.3) |
 | Hardcoded fields change | New release + user updates for every field tweak | Single `fields.ts` declaration keeps the later schema migration contained (§8) |
 | Remote dev has no route to the server | Extension silently dead | `extensionKind` + one remote test (§9.4) |
@@ -364,6 +477,6 @@ conditions.
 4. **Distribution.** Public Marketplace, a private/internal gallery, or a `.vsix` file
    passed around? This changes the update story and whether we need a version check.
 5. **Multiple submissions.** May a user have several forms in flight, or is one at a time
-   sufficient? The singleton panel in §8 assumes one at a time.
+   sufficient? The single sidebar form view in §8 assumes one at a time.
 6. **Telemetry.** Any requirement to report delivery/response metrics beyond what the
    server already sees?
