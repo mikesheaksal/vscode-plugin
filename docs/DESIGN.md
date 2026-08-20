@@ -21,7 +21,12 @@ network drops, the token expires, or the user has six windows open.
 | Question | Decision | Consequence |
 |---|---|---|
 | IDE | VS Code extension, TypeScript / Node | `.vsix` package; no VSIX/C# work |
-| Server → client transport | **SSE**, long-poll fallback | Push latency without a WebSocket; survives most corporate proxies |
+| Backend | **Go**, gRPC + grpc-gateway | Contract lives in `.proto`; the extension talks JSON to the gateway (§5) |
+| Server → client transport | **Server-streaming RPC** (NDJSON over chunked HTTP), long-poll fallback | Push latency without a WebSocket; simpler client parser than SSE (§5.1) |
+| Alert lifetime | Persist until answered or **revoked by the server** | No client-side expiry; alerts survive restarts (§7.4) |
+| Identity | Client-id file on the machine, token separately (§6) | Server routes alerts by client id |
+| Distribution | **`.vsix` passed around** | No auto-update, so version skew is a first-class concern (Phase 9) |
+| Telemetry | **None** | The extension reports nothing beyond the six RPCs |
 | Form fields | **Hardcoded** in the extension, except GPU Type's options | Simple and type-safe; field changes require a new release, GPU list does not (§5.4) |
 | Auth | **API token from settings**, fallback to a known local file | No IdP work; token handling needs care (§6) |
 | Entry point | **Activity Bar container** with a form view and an alerts view | Permanent icon in the left strip; form is one click away (§3) |
@@ -118,7 +123,7 @@ adequate, so this is an escape hatch rather than a load-bearing part of the desi
 │        │                                                                      │
 │        ├── ConfigService      settings, token resolution, change watching     │
 │        ├── ApiClient          fetch wrapper: auth header, retry, error map    │
-│        ├── EventStream        SSE connect / parse / heartbeat / backoff       │
+│        ├── EventStream        stream connect / NDJSON parse / heartbeat / backoff │
 │        │        │                                                             │
 │        │        └──> AlertService   dedupe → showInformationMessage → respond │
 │        │                                                                      │
@@ -130,16 +135,16 @@ adequate, so this is an escape hatch rather than a load-bearing part of the desi
 │        ├── Outbox             durable queue of unsent responses/submissions   │
 │        └── Logger             OutputChannel "Acme Alerts"                     │
 └───────────────────────────────────────────────────────────────────────────────┘
-                    │  HTTPS                            ▲  SSE (text/event-stream)
+                    │  HTTPS                            ▲  chunked NDJSON stream  
                     ▼                                   │
-┌───────────────────────────────── Server ──────────────────────────────────────┐
-│  GET  /api/v1/events                      SSE stream of alerts                 │
-│  GET  /api/v1/alerts/pending              catch-up / long-poll fallback        │
+┌──────────────────── Server (Go, gRPC + grpc-gateway) ─────────────────────────┐
+│  GET  /api/v1/client                      identity + min client version        │
+│  GET  /api/v1/events                      server-stream of alerts (NDJSON)     │
+│  GET  /api/v1/alerts:pending              catch-up / long-poll fallback        │
 │  POST /api/v1/alerts/{id}/response        user's button choice or dismissal    │
-│  POST /api/v1/forms/{formType}/submissions  form payload                       │
-│  GET  /api/v1/me                          token validation, user identity      │
+│  GET  /api/v1/form-config                 GPU catalogue + current allocation   │
+│  POST /api/v1/resource-requests           form submission                      │
 └───────────────────────────────────────────────────────────────────────────────┘
-```
 
 Module boundaries matter for one practical reason: `ApiClient`, `EventStream`, `Outbox`
 and validation must be unit-testable without a running VS Code, so nothing in them may
@@ -148,137 +153,153 @@ providers and `ConfigService` touch the VS Code API.
 
 ## 5. Wire protocol
 
-### 5.1 Alert (server → client, SSE event `alert`)
+**The contract is [`proto/acme/alerts/v1/alerts.proto`](../proto/acme/alerts/v1/alerts.proto).**
+That file is the source of truth; this section covers only what the projection from gRPC
+onto JSON/HTTP means for the client, which is not visible in the annotations themselves.
 
-```json
-{
-  "id": "alt_01J8XZ...",
-  "severity": "info",
-  "title": "Deployment approval needed",
-  "message": "build #4821 is waiting for your approval.",
-  "modal": false,
-  "buttons": [
-    { "id": "approve", "label": "Approve", "isPrimary": true },
-    { "id": "reject",  "label": "Reject" }
-  ],
-  "expiresAt": "2026-08-20T12:00:00Z"
-}
+Six RPCs:
+
+| RPC | HTTP | Purpose |
+|---|---|---|
+| `GetClientInfo` | `GET /api/v1/client` | Validate token + client id, learn `min_client_version` |
+| `SubscribeEvents` | `GET /api/v1/events` | Server stream of alerts, revocations, heartbeats |
+| `ListPendingAlerts` | `GET /api/v1/alerts:pending` | Catch-up on activation; long-poll fallback |
+| `RespondToAlert` | `POST /api/v1/alerts/{alert_id}/response` | Record the user's answer |
+| `GetFormConfig` | `GET /api/v1/form-config` | GPU catalogue + current allocation + bounds |
+| `SubmitResourceRequest` | `POST /api/v1/resource-requests` | Submit the form |
+
+### 5.1 The streaming response is NDJSON, not SSE
+
+This corrects an assumption in the earlier draft of this document, and it is the single
+most important thing for the client author to know.
+
+grpc-gateway renders a server-streaming RPC as a chunked HTTP response carrying **one JSON
+object per line**, each wrapped in a result envelope:
+
+```
+{"result":{"sequence":"41","heartbeat":{"serverTime":"2026-08-20T10:00:00Z"}}}
+{"result":{"sequence":"42","alert":{"alertId":"alt_01J8XZ","severity":"SEVERITY_WARNING",...}}}
+{"error":{"code":16,"message":"token expired","details":[]}}
 ```
 
-Rules:
-- `id` is server-assigned, globally unique, and is the dedupe key.
-- `buttons` has 0–2 entries. The client truncates anything longer rather than failing.
-- `severity` selects `showInformationMessage` / `showWarningMessage` / `showErrorMessage`.
-- `modal: true` blocks the UI until answered. Use sparingly — it steals focus mid-typing.
-- `expiresAt` past → client drops the alert silently and reports `expired`.
+Consequences, all of which the client handles:
 
-### 5.2 Alert response (client → server)
+- **No `data:` framing, no SSE comments.** The parser splits on `\n` and JSON-parses each
+  line — simpler than the SSE parser the earlier draft called for, and there is no reason
+  to bolt SSE framing onto the gateway with a custom marshaler just to match a document.
+- **Unwrap `.result`.** A line carrying `.error` instead is a terminal `google.rpc.Status`;
+  the stream is over and the client reconnects (or stops, on `UNAUTHENTICATED`).
+- **No `Last-Event-ID`, no browser auto-reconnect.** Resumption is the `last_sequence`
+  request field. Since we were reconnecting by hand anyway (§7.1), nothing is lost.
+- **Heartbeats must be in-band**, because there are no SSE comment frames. Hence the
+  `Heartbeat` variant in the `Event` oneof.
+- **Buffering is still the risk it always was.** The Go handler must call `Flush()` per
+  message, and any proxy in front needs `X-Accel-Buffering: no` and no response
+  compression, or events arrive in clumps. This is what the long-poll fallback exists for.
 
-`POST /api/v1/alerts/{id}/response`
+### 5.2 JSON field naming
 
-```json
-{
-  "outcome": "answered",          // answered | dismissed | expired
-  "buttonId": "approve",          // null unless outcome == answered
-  "respondedAt": "2026-08-20T11:58:03Z",
-  "deviceId": "dev_9f2c..."
-}
-```
+We use **default proto3 JSON**: `lowerCamelCase` field names, enums as their full string
+names (`"SEVERITY_WARNING"`), `uint64` as a **string** (`"sequence": "42"`), and
+`google.protobuf.Timestamp` as RFC 3339.
 
-Idempotent on `(alertId, deviceId)`. A repeat POST returns `200`; a *different* answer to
-an already-answered alert returns `409`, which the client logs and ignores (§9.3).
+That means the gateway must be built with the standard marshaler and **not**
+`UseProtoNames: true` — otherwise the server emits `gpu_type_id` while the generated
+TypeScript expects `gpuTypeId`, and the mismatch will not show up until runtime.
+`EmitUnpopulated` stays **false**, which is what keeps an unset `gpu_count` genuinely
+absent from the JSON rather than serialised as `0` (§8.3).
 
-### 5.3 Form submission (client → server)
+The `uint64`-as-string rule catches people out: `sequence` is a quoted string in JSON and
+must be parsed with `BigInt` or compared as a string, not read as a number.
 
-`POST /api/v1/forms/resource-request/submissions` with header `Idempotency-Key: <uuid v4>`
+### 5.3 Identity and idempotency travel in the body, not in headers
 
-```json
-{
-  "gpuType": "h100-80",
-  "gpuCount": 4,
-  "cpuCores": 32,
-  "ramGb": 256,
-  "ssdGb": 1024,
-  "clientContext": {
-    "extensionVersion": "0.1.0",
-    "vscodeVersion": "1.9x.x",
-    "platform": "linux",
-    "optionsEtag": "W/\"g7c1\""
-  }
-}
-```
+`Idempotency-Key` and the client id are request **fields**, not HTTP headers, even though
+headers would be the more conventional REST choice. The reason is specific to
+grpc-gateway: its default incoming-header matcher forwards only a fixed set of permanent
+HTTP headers plus anything prefixed `Grpc-Metadata-`. A custom `Idempotency-Key` header
+would silently not arrive unless the server installs a `WithIncomingHeaderMatcher`, and
+"silently not arrive" is the worst possible failure mode for an idempotency key.
 
-Field contract:
+Putting them in the message makes them part of the contract, visible in the generated
+types on both sides, and identical whether a caller speaks gRPC or JSON.
 
-| Field | Key | Type | Range | Required |
-|---|---|---|---|---|
-| GPU Type | `gpuType` | string id from `/form-options` | any returned id, incl. `none` | yes |
-| Number of GPUs | `gpuCount` | integer | 1–8, or the option's `maxCount` | **only when** `gpuType != "none"` |
-| CPU cores | `cpuCores` | integer | 1–256 | yes |
-| RAM | `ramGb` | integer, GB | 1–2048 | yes |
-| SSD | `ssdGb` | integer, GB | 1–2048 | yes |
+`Authorization` is the exception and stays a header — it is on the permanent list, it is
+what every HTTP client and proxy already understands, and it is not part of the domain.
 
-`gpuCount` is **omitted entirely** when `gpuType` is `none` — not sent as `0` or `null`.
-A request with `gpuType: "none"` and a `gpuCount` present is a client bug, and the server
-should reject it with `422` rather than silently ignoring the field. Being strict here
-means a future bug in the conditional logic surfaces immediately instead of quietly
-provisioning the wrong thing.
+### 5.4 Errors
 
-`optionsEtag` lets the server see which version of the GPU list the client was rendering,
-which turns "user picked a type we just retired" from a mystery into a one-line diagnosis.
+Standard gRPC statuses, mapped by the gateway. The codes the client acts on:
 
-Response `201 { "id": "req_...", "url": "https://..." }` — the client shows a notification
-with an "Open" button linking to `url`.
+| gRPC code | HTTP | Client behaviour |
+|---|---|---|
+| `INVALID_ARGUMENT` | 400 | Field-level errors mapped back onto inputs (§8.7); never retried |
+| `UNAUTHENTICATED` | 401 | Re-resolve the token once, then prompt; stop reconnecting (§6.3) |
+| `PERMISSION_DENIED` | 403 | Token is not authorized for this client id; prompt, do not retry |
+| `NOT_FOUND` | 404 | Unknown alert or client id; drop from the view and log |
+| `FAILED_PRECONDITION` | 400 | Alert already revoked or answered elsewhere; refresh the view |
+| `ABORTED` | 409 | Conflicting answer to an already-answered alert; log, do not surface |
+| `RESOURCE_EXHAUSTED` | 429 | Honour `Retry-After`, back off |
+| `UNAVAILABLE` / network | 503 | Outbox + backoff (§9.1) |
 
-Relevant `422` codes: `invalid_gpu_type` (unknown or retired id), `gpu_count_not_allowed`
-(sent with `none`), `gpu_count_out_of_range` (exceeds that type's `maxCount`),
-`out_of_range` (any numeric field). All are handled by §8.7.
+Note there is no 422 — gRPC has no equivalent, so validation failures are
+`INVALID_ARGUMENT` → 400 carrying `google.rpc.BadRequest` with a `FieldViolation` per bad
+field. The `field` string matches the proto path (`spec.ram_gb`), which is what lets the
+client map a violation to the right input without a bespoke error vocabulary. **When
+cross-field limits arrive later, they need no client change** — a new violation on
+`spec.cpu_cores` renders next to the CPU field automatically.
 
-### 5.4 Form options (server → client)
+### 5.5 Code generation
 
-The one piece of the form that is not hardcoded.
+`buf generate` (see [`proto/buf.gen.yaml`](../proto/buf.gen.yaml)) produces, from the one
+file: Go message and gRPC stubs, the grpc-gateway mux, an OpenAPI v2 document, and
+**TypeScript types for the extension**. The client speaks JSON to the gateway rather than
+gRPC, but generating its types from the same proto means a field rename breaks the
+TypeScript build instead of a user's form. That is most of the payoff of doing this
+proto-first, and it costs one plugin entry.
 
-`GET /api/v1/form-options` with `If-None-Match: <etag>` → `304` when unchanged.
+`buf breaking` in CI against the main branch is worth adding on day one, because the
+.vsix distribution model (Phase 9) means old clients stay in the field indefinitely.
 
-```json
-{
-  "gpuTypes": [
-    { "id": "none",    "label": "No GPU",            "maxCount": 0 },
-    { "id": "a100-40", "label": "NVIDIA A100 40GB",  "maxCount": 8 },
-    { "id": "h100-80", "label": "NVIDIA H100 80GB",  "maxCount": 4 }
-  ]
-}
-```
+### 5.6 If grpc-gateway is dropped
 
-Two deliberate choices:
+Nothing above except §5.1–5.3 depends on it. The six operations, their payloads, the
+persistence and revocation semantics, and every client behaviour in §7–§9 are transport
+decisions, not gateway decisions. Serving the same JSON from plain `net/http` handlers
+would change three things and no more: the streaming envelope stops being
+`{"result": …}` and becomes the bare `Event` per line, field naming becomes whatever the
+Go structs say, and error bodies need a shape of their own in place of `google.rpc.Status`.
+The proto stays useful as the contract document either way.
 
-- **The `none` option is server-supplied**, with the reserved id `none`, so its label is
-  the backend's to word ("No GPU", "CPU only", …). The client still synthesises it if the
-  server omits it, because a form with no way to say "no GPU" is broken — but that path
-  logs a warning, since it means the contract was not honoured.
-- **`maxCount` is per option.** A blanket 1–8 is almost certainly wrong: node topologies
-  differ per accelerator, and hard-coding 8 in the extension means shipping a release to
-  correct it. The client clamps to `min(maxCount, 8)` and falls back to 8 if the field is
-  absent, so a server that never sends `maxCount` still behaves exactly as specified.
+## 6. Identity and authentication
 
-Order is preserved as sent — the backend controls what appears first. The client does not
-re-sort.
+Two separate things, and conflating them is the mistake to avoid: the **client id** says
+*which machine this is* and is what the server routes alerts to; the **token** proves the
+caller is allowed to act as it.
 
-### 5.5 Errors
+### 6.0 The client id
 
-Single shape for every non-2xx, so the client has one error path:
+Read from a file on the user's machine — `acmeAlerts.clientIdFilePath`, defaulting to
+`$XDG_CONFIG_HOME/acme-alerts/client-id` (`~/.config/...`) and
+`%APPDATA%\acme-alerts\client-id` on Windows. First line, trimmed.
 
-```json
-{ "error": { "code": "unauthorized", "message": "token expired", "retryable": false } }
-```
+- **Never generated by the client.** A self-invented id is one the server has never heard
+  of, so it routes nothing and the user sees an extension that silently does nothing. A
+  missing file is a configuration error and is surfaced as one: both views switch to a
+  `viewsWelcome` state naming the exact path that was searched, with a "Reload" button.
+- **Watched for changes** with an fs watcher, so provisioning the file makes the extension
+  come alive without a window reload.
+- **Not a secret**, so it travels as an ordinary request field and appears in query
+  strings and access logs. That is fine *provided* the server enforces the pairing: it
+  must reject a token that is not authorized for the presented client id with
+  `PERMISSION_DENIED`. Without that check, any valid token could subscribe to any
+  client's alerts — the client id would become an authorization bypass rather than a
+  routing key.
+- **A single credentials file is also accepted.** If the token file (or the client-id
+  file) contains JSON with `client_id` and `token` keys, both are taken from it. One file
+  to provision is a better operator story than two, and it costs about ten lines.
 
-Client behaviour by status: `401/403` → re-resolve token, then prompt (§6.3);
-`429` → honour `Retry-After`; `5xx`/network → outbox + backoff; `4xx` other → surface to
-user, do not retry.
-
-## 6. Authentication
-
-### 6.1 Resolution order
+### 6.1 Token resolution order
 
 1. Setting `acmeAlerts.apiToken` — if non-empty.
 2. `SecretStorage` — where a token entered via the `Acme Alerts: Sign In` command lives,
@@ -306,34 +327,41 @@ accident when placed in `.vscode/settings.json`. So:
 
 ### 6.3 Failure handling
 
-On `401`: drop the cached token, re-resolve from scratch (the file may have been
-refreshed by an external tool), retry the request exactly once. If it fails again, stop
-the reconnect loop, switch both views to their signed-out `viewsWelcome` state (§3.3), and
-show one notification with a "Sign In" button. Do not loop on a bad token.
+On `UNAUTHENTICATED` (401): drop the cached token, re-resolve from scratch (the file may
+have been refreshed by an external tool), retry the request exactly once. If it fails
+again, stop the reconnect loop, switch both views to their signed-out `viewsWelcome` state
+(§3.3), and show one notification with a "Sign In" button. Do not loop on a bad token.
+
+On `PERMISSION_DENIED` (403) the token is valid but not paired with this client id. That
+is a provisioning error, not an expiry, so retrying and re-prompting for a token both
+waste the user's time: report it as "This token is not authorized for client
+`<id>`" and stop.
 
 ## 7. Alert delivery
 
 ### 7.1 Connection lifecycle
 
 - `activationEvents: ["onStartupFinished"]` — do not block startup.
-- On activate: resolve token → `GET /api/v1/me` to validate → `GET /api/v1/alerts/pending`
-  to catch up on anything missed while offline → open the SSE stream.
-- SSE request carries `Authorization: Bearer`, `Accept: text/event-stream`, and
-  `Last-Event-ID` when resuming. Server must send `Cache-Control: no-cache`,
-  `X-Accel-Buffering: no`, and must not gzip the stream, or proxies will buffer it into
-  uselessness.
-- Server sends a `ping` comment every 25s. If the client sees no bytes for 60s it tears
-  down the socket and reconnects — a half-open TCP connection is otherwise invisible.
-- Reconnect backoff: 1s, 2s, 4s … capped at 60s, with ±20% jitter so a server restart
-  does not produce a thundering herd. Reset on any successfully received event.
-- After 5 consecutive SSE failures, fall back to long-poll
-  (`GET /api/v1/alerts/pending?wait=30`) and retry SSE every 5 minutes.
+- On activate: resolve client id and token → `GetClientInfo` to validate both and read
+  `min_client_version` → restore persisted alerts into the view (§7.4) →
+  `ListPendingAlerts` to reconcile with the server → open the event stream.
+- The stream request carries `Authorization: Bearer`, plus `client_id` and `last_sequence`
+  as query parameters. The Go handler must `Flush()` after every message, and any proxy
+  in front needs `X-Accel-Buffering: no` and no response compression, or events arrive in
+  clumps instead of promptly.
+- The server sends a `Heartbeat` event every 25s. If the client sees no bytes for 60s it
+  tears down the socket and reconnects — a half-open TCP connection is otherwise
+  invisible.
+- Reconnect backoff: 1s, 2s, 4s … capped at 60s, with ±20% jitter so a server restart does
+  not produce a thundering herd. Reset on any successfully received event.
+- After 5 consecutive stream failures, fall back to long-poll
+  (`ListPendingAlerts` with `wait_seconds=30`) and retry the stream every 5 minutes.
 
-**Implementation note:** the browser `EventSource` API cannot set an `Authorization`
-header, and Node's native `EventSource` is not available across all VS Code versions we
-would support. So we consume `fetch(...).body` and parse the SSE framing ourselves —
-roughly 60 lines (split on `\n\n`, read `event:`/`data:`/`id:`/`retry:` fields) and fully
-unit-testable. This is a deliberate choice, not an oversight.
+**Implementation note:** the client consumes `fetch(...).body` and splits the NDJSON
+stream on newlines, unwrapping each line's `result` field (§5.1). That is a handful of
+lines and fully unit-testable. Note that the browser `EventSource` API would not have
+worked here regardless — it cannot set an `Authorization` header — so hand-rolling the
+reader was always going to be necessary.
 
 ### 7.2 Showing the alert
 
@@ -376,6 +404,30 @@ This also fixes the ghost-notification problem from §9.3 in the direction that 
 duplicate notification in another window cannot be closed, but the *view* in every window
 reflects true state on the next event.
 
+### 7.4 Lifetime, revocation, and persistence
+
+**An alert has no client-side expiry.** It stays outstanding until the user answers it or
+the server withdraws it. Two things follow:
+
+- **Alerts are persisted** in `globalState` — id, contents, sequence, and whether a
+  notification has already been shown — and restored into the alerts view on activation.
+  An alert that arrives while VS Code is closed, or that the user never got round to
+  answering, is still there tomorrow.
+- **On restart, persisted alerts are not re-notified individually.** They repopulate the
+  view and the badge; a single "N alerts awaiting your response" notification appears if
+  any are outstanding. Replaying six-day-old notifications at every window open is how
+  users learn to click things away without reading them.
+
+`ListPendingAlerts` on activation is the reconciliation step: the server is authoritative
+about what is still live, so anything persisted locally but absent from that response was
+answered or revoked while we were away, and is dropped.
+
+**Revocation** arrives as an `AlertRevoked` event. The alert is removed from the view and
+the badge decrements. If its notification is still on screen it cannot be closed
+programmatically (§7.2), so the stale notification remains — clicking it posts a response
+that the server rejects with `FAILED_PRECONDITION`, and the client shows "This alert is no
+longer active" rather than an error. The view, not the notification, is the honest record.
+
 ## 8. The form
 
 ### 8.1 Primary surface: a WebviewView in the sidebar
@@ -414,7 +466,7 @@ than a rewrite.
 
 | Field | Control | Range | Notes |
 |---|---|---|---|
-| GPU Type | `<select>` | options from `/form-options` | Options are dynamic; the field itself is not |
+| GPU Type | `<select>` | options from `GetFormConfig` | Options are dynamic; the field itself is not |
 | Number of GPUs | `<select>` 1…N | 1–`maxCount` (≤8) | Hidden when GPU Type is `none` |
 | CPU cores | text, `inputmode="numeric"` | 1–256 | |
 | RAM (GB) | text, `inputmode="numeric"` | 1–2048 | |
@@ -449,28 +501,47 @@ Rules, in the order they matter:
 The extension re-derives all of this before POSTing. The webview decides what to *show*;
 it never decides what to *send*.
 
-### 8.4 GPU options: fetching, caching, and failure
+### 8.4 Form config: options, defaults, and failure
 
-The GPU list is the form's one external dependency, and it is on the critical path — a
-user who cannot see the list cannot fill the form at all. So:
+`GetFormConfig` returns three things in one call — the GPU catalogue, the client's
+**current allocation**, and the numeric bounds. One call rather than three, so the form
+cannot render half-configured.
 
-- **Cached** in `globalState` alongside its ETag. On open, the form renders from cache
-  **immediately** and revalidates in the background with `If-None-Match`; a `304` costs
-  nothing and a `200` swaps the list in place, preserving the current selection if its id
-  still exists.
-- **Refreshed** on: first activation, view becoming visible when the cache is older than
-  15 minutes, an explicit refresh button in the view title, and after any
-  `invalid_gpu_type` rejection.
-- **Cold start with no cache and a failed fetch** → the form renders in an explicit error
-  state ("Couldn't load GPU types") with a Retry button, and Submit disabled. Not an empty
-  dropdown, and not a form the user fills in before discovering it cannot be sent.
-- **Stale cache with a failed refresh** → the form stays usable with a quiet inline notice
-  that the list may be out of date. Degraded beats blocked; the server validates
-  `gpuType` on submit anyway, so a retired id fails loudly at the only point where it
-  matters.
-- **The selected id disappears** from a refreshed list → the selection is cleared and the
-  field is marked with "This GPU type is no longer available." Silently substituting a
-  different accelerator would be the worst possible behaviour here.
+**Defaults are the current allocation.** This changes what the form *is*: not a blank
+request, but the machine's present configuration presented for editing. That shapes the UI:
+
+- Fields are pre-filled from `current`. A user who wants one more GPU changes one dropdown
+  instead of retyping five values they must first go and look up.
+- **Submit is disabled until something differs** from `current`, with the button reading
+  "No changes" in that state. Submitting a request identical to the running configuration
+  is never what anyone meant.
+- Changed fields carry a subtle modified marker, and the view title bar gets a **"Reset to
+  current"** action. The user can always see what they are about to change.
+- A client with **no current allocation** (`current` absent) gets an empty form and a
+  Submit enabled as soon as it validates — the first-request path still works.
+- If `current.gpu_type_id` is no longer in the catalogue, the field renders empty with
+  "Your current GPU type is no longer offered", rather than silently pre-selecting
+  something else.
+
+**Bounds come from `limits` when present**, falling back to the documented 1–256 cores,
+1–2048 GB RAM, 1–2048 GB SSD, 1–8 GPUs. Three lines of fallback buys the ability to change
+a bound without shipping a .vsix to everyone, which matters more than usual here (Phase 9).
+
+Caching and failure:
+
+- **Cached** in `globalState` with its `version`. On open the form renders from cache
+  **immediately** and revalidates in the background; a changed `version` swaps the config
+  in place, preserving the user's edits where the fields still exist.
+- **Refreshed** on activation, on the view becoming visible when the cache is older than
+  15 minutes, on an explicit refresh button, and after any `INVALID_ARGUMENT` naming
+  `spec.gpu_type_id`.
+- **Cold start with no cache and a failed fetch** → explicit error state ("Couldn't load
+  configuration") with Retry, Submit disabled. Not an empty dropdown, and not a form
+  someone fills in before discovering it cannot be sent.
+- **Stale cache with a failed refresh** → the form stays usable with a quiet notice that
+  it may be out of date. Degraded beats blocked; the server validates on submit anyway.
+  Note the defaults may also be stale in this state, which is a stronger argument than
+  before for showing the notice rather than hiding it.
 
 ### 8.5 Draft persistence
 
@@ -511,9 +582,11 @@ Disable the form → validate in the extension → POST with an `Idempotency-Key
 once per submission attempt → on success clear the draft, reset the form to defaults, show
 a confirmation notification with an "Open" button linking to the created record.
 
-On `422`, map the server's field-level codes back onto the specific inputs via
-`fieldErrors` so the user sees the problem next to the field rather than in a generic
-banner. On network failure, re-enable the form and offer to queue the submission in the
+On `INVALID_ARGUMENT` (400), map the `google.rpc.BadRequest` field violations back onto
+the specific inputs by their proto paths (`spec.ram_gb` → the RAM field) so the user sees
+the problem next to the field rather than in a generic banner. There are no client-side
+cross-field rules today, so any such limit the backend adds later arrives through exactly
+this path and needs no client change. On network failure, re-enable the form and offer to queue the submission in the
 outbox (§9.1).
 
 On success the sidebar view **resets in place** rather than closing, since there is
@@ -536,7 +609,7 @@ Alert responses and form submissions are user intent that must not evaporate bec
 network blipped. Both go through a durable queue in `globalState`:
 
 - Each entry: `{ id, kind, url, body, idempotencyKey, attempts, nextAttemptAt }`.
-- Flushed on: successful send of anything else, SSE reconnect, extension activation, and a
+- Flushed on: successful send of anything else, stream reconnect, extension activation, and a
   60s timer while non-empty.
 - Bounded at 100 entries and 7 days; older entries are dropped with a log line.
 - Because every entry carries an idempotency key, replaying after an ambiguous failure is
@@ -544,13 +617,14 @@ network blipped. Both go through a durable queue in `globalState`:
 
 ### 9.2 Duplicate delivery
 
-SSE is at-least-once — a reconnect with `Last-Event-ID` can legitimately re-deliver.
+The stream is at-least-once — a reconnect with `last_sequence` can legitimately
+re-deliver.
 The client keeps a bounded set of the last ~200 seen alert IDs (in `globalState`, with
 timestamps, pruned at 7 days) and drops repeats before showing anything.
 
 ### 9.3 Multiple windows
 
-Every open VS Code window is a separate extension host, so N windows means N SSE
+Every open VS Code window is a separate extension host, so N windows means N streaming
 connections for one user, and the same alert shown N times. Options:
 
 1. **Server fans out to all connections; client dedupes and first response wins.** The
@@ -569,7 +643,7 @@ user always has one place showing the truth.
 ### 9.4 Remote development
 
 In Remote-SSH / Dev Containers / Codespaces, extensions run on the remote host by default,
-so the SSE connection would originate there — which may not have network access to the
+so the event stream would originate there — which may not have network access to the
 alert server. Set `"extensionKind": ["ui", "workspace"]` to prefer the local side, and
 test one remote scenario before release.
 
@@ -582,14 +656,14 @@ Each phase is independently demoable. Phases 3–5 assume the mock server from P
 | 0 | Contract | This document + an OpenAPI file agreed with the backend team | Both sides sign off on §5 |
 | 1 | Skeleton | `yo code` scaffold, TS strict, ESLint, `onStartupFinished` activation, Activity Bar container + icon, placeholder views, output channel, settings contributed | F5 opens a dev host; the Activity Bar icon appears and opens a sidebar with both views |
 | 2 | Config & auth | `ConfigService` with the three-source resolution, SecretStorage migration, Sign In command, redacting logger | Unit tests cover all three sources + precedence + 401 invalidation |
-| 3 | API client + mock | `ApiClient` (auth, timeout, retry, typed errors) and a ~150-line Express mock server: `/me`, `/form-options` with ETag support, submission endpoint, and a CLI to push alerts | `GET /me` succeeds against the mock; a second `/form-options` call returns `304`; every error code maps correctly |
+| 3 | Contract + client + mock | `buf generate` wired up (Go stubs, gateway, OpenAPI, TS types); `ApiClient` over the generated types; a small **Go** mock implementing the service behind the real gateway, with a CLI to push and revoke alerts | `buf lint` and `buf breaking` pass in CI; `GetClientInfo` succeeds against the mock; every gRPC code maps to the documented client behaviour |
 | 4 | Alerts via polling | `AlertService`: catch-up poll, notification with 1–2 buttons, response POST, dedupe set; `AlertTreeProvider` with inline action buttons, badge and welcome states | Push an alert from the mock CLI → it appears in both the notification and the view, badge increments, answering either way records once |
-| 5 | SSE | `EventStream`: hand-rolled parser, heartbeat, jittered backoff, `Last-Event-ID` resume, long-poll fallback | Kill the mock mid-stream → client reconnects and receives an alert queued during the outage |
+| 5 | Event stream | `EventStream`: NDJSON reader + `result` unwrap, heartbeat timeout, jittered backoff, `last_sequence` resume, long-poll fallback | Kill the mock mid-stream → client reconnects and receives alerts queued during the outage with no gap and no duplicate |
 | 6 | Form | `WebviewView` in the sidebar, the five fields, options fetch + cache + error states, conditional GPU count, strict validation, submit, "Open in Editor" | Open from the Activity Bar → fill → submit → mock records the payload; `none` omits `gpuCount`; toggling to `none` and back restores the count; `1e3` and `12abc` are rejected; cold start with the mock down shows Retry, not an empty dropdown; collapsing the view preserves the draft |
 | 7 | Reliability | Outbox, draft persistence, alert-burst coalescing, 409 handling | Submit with the mock stopped → restart mock → submission arrives exactly once; 10 alerts at once produce one notification and 10 view entries |
 | 8 | Tests | Unit (parser, backoff, token resolution, outbox, validation) + `@vscode/test-electron` integration (commands registered, view container resolves, webview view renders) + manual matrix incl. a narrow sidebar and high-contrast theme | CI green on Linux/macOS/Windows |
-| 9 | Packaging | `vsce package`, README, CHANGELOG, icon, telemetry opt-out honoured | A `.vsix` installs cleanly on a machine that never had the dev setup |
-| 10 | Ops | Structured logs, a "Report Issue" command that dumps redacted diagnostics, version pinning between client and server | Support can diagnose a user issue from one pasted log |
+| 9 | Packaging & version skew | `vsce package`, README with install instructions, CHANGELOG, icon; `min_client_version` check with an actionable "update your .vsix" prompt | A `.vsix` installs cleanly on a machine that never had the dev setup; a deliberately old build shows the update prompt instead of failing obscurely |
+| 10 | Ops | Structured logs and a "Report Issue" command that dumps redacted diagnostics to the clipboard. **No telemetry** — the extension reports nothing beyond the six RPCs | Support can diagnose a user issue from one pasted log |
 
 Rough sizing: phases 1–4 are the first useful milestone. Phase 5 is the one that always
 takes longer than estimated, because reconnect edge cases only appear under real network
@@ -602,46 +676,47 @@ conditions.
 | Activity Bar slot is intrusive for low-frequency users | Users hide the container and stop seeing alerts | Notifications remain the primary alert channel and work with the container hidden (§3.5) |
 | Sidebar too narrow for comfortable typing | Users avoid the form | Five short fields fit; fluid single-column layout plus "Open in Editor" (§8.8) |
 | `WebviewView` torn down when hidden | Lost input, reported as a data-loss bug | Draft persistence on every change, tested explicitly in Phase 6 (§8.5) |
-| Corporate proxy buffers SSE | Alerts arrive minutes late or never | Correct response headers; long-poll fallback; test behind the real proxy in Phase 5 |
+| Corporate proxy buffers the chunked stream | Alerts arrive minutes late or never | Per-message `Flush()`, `X-Accel-Buffering: no`, no compression; long-poll fallback; test behind the real proxy in Phase 5 |
 | Token in `settings.json` leaks via Settings Sync or a commit | Credential exposure | Application-scoped setting, SecretStorage migration, redacting logger (§6.2) |
 | Notification bursts | Users miss alerts | Coalescing into one notification + the alerts view and its badge (§7.3) |
 | Duplicate alerts across windows | Ghost notifications | Dedupe + `409` handling (§9.3) |
 | Hardcoded fields change | New release + user updates for every field tweak | Single `fields.ts` declaration keeps the later schema migration contained (§8.2) |
 | GPU list unreachable on a cold start | Form is unusable, not merely degraded | Cached list + explicit error state with Retry instead of an empty dropdown (§8.4) |
 | Lenient numeric parsing | Silently provisioning the wrong resources | Strict integer parser, no `parseInt`; server validates independently (§8.6) |
-| GPU type retired between render and submit | Request provisioned against a dead type | `optionsEtag` on submit, `invalid_gpu_type` → refresh + clear selection, never substitute (§8.4) |
+| GPU type retired between render and submit | Request provisioned against a dead type | `form_config_version` on submit, violation on `spec.gpu_type_id` → refresh + clear selection, never substitute (§8.4) |
 | Remote dev has no route to the server | Extension silently dead | `extensionKind` + one remote test (§9.4) |
+| `.vsix` never auto-updates | Old clients stay in the field indefinitely | `min_client_version` from `GetClientInfo` + `buf breaking` in CI; additive proto changes only (Phase 9) |
+| Client-id file missing or unprovisioned | Extension appears to do nothing at all | Explicit `viewsWelcome` naming the searched path; never self-generate an id (§6.0) |
+| Token valid but not paired with the client id | Silent cross-client alert delivery | Server must enforce the pairing and return `PERMISSION_DENIED` (§6.0) |
 
-## 12. Open questions
+## 12. Settled, and what remains
 
-Resolved: the form fields are specified in §5.3 and §8.2. Phase 6 is unblocked.
+All of §12's earlier questions are answered and folded into the design above:
 
-Assumptions made while specifying them — each is a decision the backend can overturn
-cheaply, but they are decisions, so they are listed rather than buried:
+| Question | Answer | Where it landed |
+|---|---|---|
+| Form fields | GPU type + count, CPU, RAM, SSD | §5 proto, §8.2 |
+| RAM/SSD granularity | Any integer in range | §8.2 |
+| Defaults | The client's current configuration, from the backend | §8.4 |
+| Cross-field limits | None for now, may change | §8.7 — arrives as field violations, no client change needed |
+| Alert lifetime | Persist until answered; server may revoke | §7.4, `AlertRevoked` |
+| Routing | Client-id file on the machine | §6.0 |
+| Distribution | `.vsix` passed around | Phase 9, `min_client_version` |
+| Multiple submissions | One at a time | §8.1 single view |
+| Telemetry | None | Phase 10 |
 
-1. **`maxCount` is per GPU type**, defaulting to 8 when the server omits it (§5.4). If the
-   limit really is a flat 1–8 across every accelerator, the field can be dropped and
-   nothing else changes.
-2. **The `none` option comes from the server** with the reserved id `none`. The client
-   synthesises it if absent, but logs a warning.
-3. **RAM and SSD accept any integer** in 1–2048 GB. If the backend only provisions certain
-   increments (powers of two, multiples of 8), say so and the controls become steppers or
-   dropdowns — better to constrain the input than to reject it after the fact.
-4. **No defaults.** Every field starts empty and the user fills all of them. If there is a
-   common configuration worth pre-filling, a default set would measurably reduce effort.
-5. **No cross-field limits.** Nothing currently stops 1 CPU core with 2048 GB of RAM, or
-   8 H100s with 1 core. If the backend enforces ratios or per-user quotas, the client
-   should know them so it can warn before submission rather than after.
+Two assumptions remain, both cheap for the backend to overturn:
 
-Still open:
+1. **`max_count` is per GPU type**, defaulting to 8 when omitted (§5 proto). If the limit
+   really is a flat 1–8 across every accelerator, drop the field and nothing else changes.
+2. **The `none` option is server-supplied** with the reserved id `none`, so the backend
+   words its label. The client synthesises it if absent, but logs a warning.
 
-6. **Alert lifetime.** Should an unanswered alert expire client-side and report `expired`,
-   or persist until answered across restarts?
-7. **Server-side routing.** How does the server decide *which* user gets an alert — is
-   there a user registry, or does the client announce itself on connect?
-8. **Distribution.** Public Marketplace, a private/internal gallery, or a `.vsix` file
-   passed around? This changes the update story and whether we need a version check.
-9. **Multiple submissions.** May a user have several requests in flight, or is one at a
-   time sufficient? The single sidebar form view in §8 assumes one at a time.
-10. **Telemetry.** Any requirement to report delivery/response metrics beyond what the
-    server already sees?
+And one genuine question, which only matters for wording:
+
+3. **What is this form called to the user?** Now that it opens pre-filled with the current
+   allocation, it reads as "change my machine" rather than "request a machine". The view
+   is currently titled "New Request" and the button says "Submit". If the backend applies
+   changes directly, "Configuration" and "Apply changes" would describe it more honestly;
+   if a human approves each one, the request framing is right. `RequestStatus` in the
+   proto supports either.

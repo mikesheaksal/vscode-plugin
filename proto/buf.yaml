@@ -1,0 +1,16 @@
+version: v2
+modules:
+  - path: .
+deps:
+  - buf.build/googleapis/googleapis
+lint:
+  use:
+    - STANDARD
+  except:
+    # The events RPC streams a oneof of heterogeneous event types. Naming it
+    # SubscribeEventsResponse would describe the transport rather than the
+    # thing, and every call site reads worse for it.
+    - RPC_RESPONSE_STANDARD_NAME
+breaking:
+  use:
+    - FILE
