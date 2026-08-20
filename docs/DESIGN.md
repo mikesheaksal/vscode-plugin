@@ -30,7 +30,7 @@ network drops, the token expires, or the user has six windows open.
 | Distribution | **`.vsix` passed around** | No auto-update, so version skew is a first-class concern (Phase 9) |
 | Telemetry | **None** | The extension reports nothing beyond the six RPCs |
 | Form fields | **Hardcoded** in the extension, except GPU Type's options | Simple and type-safe; field changes require a new release, GPU list does not (§5.4) |
-| Form semantics | **Edit the current machine**, applied directly by the backend | Destructive: needs confirmation + optimistic concurrency (§8.7, §8.9) |
+| Form semantics | **Edit the current machine**, applied directly by the backend | Destructive: server-computed preview, confirmation, cancellation window, optimistic concurrency (§8.7–§8.9) |
 | Auth | **API token from settings**, fallback to a known local file | No IdP work; token handling needs care (§6) |
 | Entry point | **Activity Bar container** with a form view and an alerts view | Permanent icon in the left strip; form is one click away (§3) |
 
@@ -147,7 +147,9 @@ adequate, so this is an escape hatch rather than a load-bearing part of the desi
 │  GET  /api/v1/alerts:pending              catch-up / long-poll fallback        │
 │  POST /api/v1/alerts/{id}/response        user's button choice or dismissal    │
 │  GET  /api/v1/machine/config              catalogue + current config + limits  │
+│  POST /api/v1/machine/config:preview      what would this change do?           │
 │  POST /api/v1/machine/config:apply        apply a new configuration            │
+│  POST /api/v1/machine/changes/{id}:cancel abort within the cancel window       │
 └───────────────────────────────────────────────────────────────────────────────┘
 
 Module boundaries matter for one practical reason: `ApiClient`, `EventStream`, `Outbox`
@@ -161,7 +163,7 @@ providers and `ConfigService` touch the VS Code API.
 That file is the source of truth; this section covers only what the projection from gRPC
 onto JSON/HTTP means for the client, which is not visible in the annotations themselves.
 
-Six RPCs:
+Eight RPCs:
 
 | RPC | HTTP | Purpose |
 |---|---|---|
@@ -170,7 +172,9 @@ Six RPCs:
 | `ListPendingAlerts` | `GET /api/v1/alerts:pending` | Catch-up on activation; long-poll fallback |
 | `RespondToAlert` | `POST /api/v1/alerts/{alert_id}/response` | Record the user's answer |
 | `GetMachineConfig` | `GET /api/v1/machine/config` | GPU catalogue + current config + bounds + any change in flight |
+| `PreviewMachineConfig` | `POST /api/v1/machine/config:preview` | What would this change do? Restart? Valid? |
 | `ApplyMachineConfig` | `POST /api/v1/machine/config:apply` | Apply a new configuration directly |
+| `CancelMachineChange` | `POST /api/v1/machine/changes/{change_id}:cancel` | Abort within the cancellation window |
 
 ### 5.1 The streaming response is NDJSON, not SSE
 
@@ -531,7 +535,7 @@ One call rather than four, so the form cannot render half-configured.
 - If `current.gpu_type_id` is no longer in the catalogue, the field renders empty with
   "Your current GPU type is no longer offered", rather than silently pre-selecting
   something else. Note that in this state *any* apply necessarily changes the GPU, so the
-  confirmation dialog (§8.7) says so explicitly.
+  confirmation dialog (§8.7) says so explicitly — the preview will report the restart.
 
 **Bounds come from `limits` when present**, falling back to the documented 1–256 cores,
 1–2048 GB RAM, 1–2048 GB SSD, 1–8 GPUs. Three lines of fallback buys the ability to change
@@ -591,59 +595,87 @@ while someone is still typing `128` trains users to ignore the error text.
 ### 8.7 Confirming intent
 
 Apply reconfigures a live machine with no approval step behind it, so the button is not
-the point of no return — the confirmation is.
+the point of no return — the confirmation is. And the confirmation is only worth having if
+it states the *real* consequences, which the extension cannot work out for itself: a
+restart is required by some changes and not others, and only the server knows which.
 
-On Apply, before any request goes out, a **modal dialog** shows the diff and nothing else:
+So Apply runs `PreviewMachineConfig` first, then shows a **modal dialog** built from the
+result:
 
 ```
 Apply these changes to your machine?
 
-  GPU        NVIDIA A100 40GB x2  ->  NVIDIA H100 80GB x4
+  GPU        NVIDIA A100 40GB x2  ->  NVIDIA H100 80GB x4   requires a restart
   CPU cores  32                   ->  64
   RAM        256 GB               ->  512 GB
   SSD        1024 GB                  (unchanged)
 
 This will restart your machine. Running jobs will be terminated.
+You can cancel within 30 seconds of starting.
 
                             [ Apply changes ]  [ Cancel ]
 ```
 
-Details that matter:
+- **The restart notice is attributed to the field that causes it.** `ChangeEffect` carries
+  a `field_path` and `requires_restart` per changed field, so the dialog says *the GPU
+  swap* forces the reboot rather than warning about the change as an undifferentiated
+  whole. A user who learns their disk increase is free will make different choices.
+- **When nothing requires a restart, the warning is absent** and the dialog is a plain
+  summary. Warning about a reboot that will not happen is how warnings stop being read.
+- **Preview doubles as pre-flight validation.** The server checks the spec before anything
+  destructive happens, so the user never confirms a change that is then rejected. This is
+  also where a future cross-field limit surfaces — at preview time, next to the field, not
+  after the commit.
+- **The cancellation window is stated up front** (`cancellation_window_seconds`), because
+  "you have 30 seconds to change your mind" is information people want *before* deciding,
+  not after.
+- **If preview fails, no dialog is shown.** A confirmation that cannot state its
+  consequences is worse than none; the user gets a retryable error instead.
+- **The dialog is not suppressible.** No "don't ask again". Destructive, infrequent, one
+  extra click.
+- Cancel returns to the form with edits intact. Cancelling is not discarding.
 
-- **Only changed rows are emphasised**; unchanged ones are shown greyed for context rather
-  than hidden, so the user can confirm the whole resulting state at a glance.
-- **The warning line comes from the server** (`requires_restart`, `change_warning`). The
-  extension cannot know whether reconfiguring costs a reboot, and guessing either
-  frightens people needlessly or fails to warn them.
-- **The dialog is not suppressible.** No "don't ask again" checkbox. The action is
-  destructive, infrequent, and costs one extra click — a bad trade to optimise away.
-- Cancel returns to the form with the edits intact. Cancelling is not discarding.
+### 8.8 Applying, cancelling, and failing
 
-### 8.8 Applying, and what happens next
-
-`ApplyMachineConfig` returns as soon as the change is *accepted*, not when it is finished —
-reprovisioning takes as long as it takes. So:
+`ApplyMachineConfig` returns as soon as the change is *accepted*, not when it is finished.
 
 1. Validate in the extension → POST with `idempotency_key` and `expected_version`.
 2. The response carries a `MachineChange` with status `APPLYING`. The form goes
-   **read-only** with an "Applying changes…" state and a progress indicator; the view
-   shows the same, so it is visible without opening the form.
+   **read-only** with an "Applying changes…" state; the view shows the same, so progress
+   is visible without opening the form.
 3. Completion arrives as a **`MachineConfigChanged` event on the stream**, not by polling.
-   The form refreshes its current values from the event, returns to editable, and a
-   notification reports success (with an "Open" button when `url` is set) or failure (with
-   `failure_reason` shown verbatim).
-4. If the stream is down, the fallback is a `GetMachineConfig` poll every 15s while a
-   change is pending, stopping when `pending_change` clears.
+   The form refreshes, returns to editable, and a notification reports the outcome.
+4. If the stream is down, fall back to polling `GetMachineConfig` every 15s while a change
+   is pending, stopping when `pending_change` clears.
 
-Because `pending_change` is part of `GetMachineConfig`, a user who closes VS Code mid-apply
-and reopens it lands back in the "Applying changes…" state rather than seeing a stale
-editable form.
+**The cancellation window.** `MachineChange.cancellable_until` is a deadline, so the
+applying state shows a **Cancel button with a live countdown** — "Cancel (23s)" — which
+disables itself when the deadline passes. Two details:
+
+- The countdown is rendered against the server's clock, not the user's: the client tracks
+  the offset from `ApplyMachineConfigResponse.server_time` and from heartbeats. A user
+  whose laptop clock is four minutes fast would otherwise see the button vanish
+  immediately.
+- **The client's countdown is advisory.** The server decides whether a cancel arrived in
+  time, so a click near the boundary can still lose the race. That returns
+  `FAILED_PRECONDITION`, and the right response is "Too late to cancel — the change is
+  being applied", staying in the applying state. It is a normal outcome, not an error.
+
+**Failure and cancellation are the same thing to the machine.** The server reverts, so the
+machine is on its previous configuration either way — there is no partial state to
+represent, which removes an entire category of UI ("your machine may be in an inconsistent
+state") that would otherwise be needed. The client says so plainly:
+
+- Failed → "Couldn't apply changes. Your machine is unchanged." plus `failure_reason`.
+- Cancelled → "Changes cancelled. Your machine is unchanged."
+
+In both cases the user's edits stay in the form so they can adjust and try again, and the
+refreshed `current` will match what they started from.
 
 On `INVALID_ARGUMENT` (400), map the `google.rpc.BadRequest` field violations back onto the
-specific inputs by their proto paths (`spec.ram_gb` → the RAM field) so the user sees the
-problem next to the field rather than in a generic banner. There are no client-side
-cross-field rules today, so any such limit the backend adds later arrives through exactly
-this path and needs no client change.
+specific inputs by their proto paths (`spec.ram_gb` → the RAM field). Since preview
+validates first, reaching this on apply means something changed in between — refresh and
+show what.
 
 **A failed apply does not go in the outbox** — see §9.1, the one place where durable retry
 is the wrong answer.
@@ -739,7 +771,7 @@ Each phase is independently demoable. Phases 3–5 assume the mock server from P
 | 4 | Alerts via polling | `AlertService`: catch-up poll, notification with 1–2 buttons, response POST, dedupe set; `AlertTreeProvider` with inline action buttons, badge and welcome states | Push an alert from the mock CLI → it appears in both the notification and the view, badge increments, answering either way records once |
 | 5 | Event stream | `EventStream`: NDJSON reader + `result` unwrap, heartbeat timeout, jittered backoff, `last_sequence` resume, long-poll fallback | Kill the mock mid-stream → client reconnects and receives alerts queued during the outage with no gap and no duplicate |
 | 6 | Machine form | `WebviewView` in the sidebar, the five fields, config fetch + cache + error states, pre-fill from current, conditional GPU count, strict validation, "Open in Editor" | Open from the Activity Bar → current config is pre-filled → Apply is disabled until something differs; `none` omits `gpuCount`; toggling to `none` and back restores the count; `1e3` and `12abc` are rejected; cold start with the mock down shows Retry, not an empty dropdown; collapsing the view preserves the draft |
-| 6b | Applying | Confirmation diff dialog, `APPLYING` read-only state, completion via `MachineConfigChanged`, poll fallback, `expected_version` conflict handling | Apply → dialog lists exactly the changed fields and the server's restart warning → Cancel keeps edits → confirm → form locks → mock completes → form unlocks with new current values; a change applied from a second window updates the first live; applying against a stale version shows what changed instead of clobbering it |
+| 6b | Applying | Preview-driven confirmation dialog, `APPLYING` read-only state, cancel countdown with clock-skew correction, completion via `MachineConfigChanged`, poll fallback, `expected_version` conflict handling | Apply → preview runs → dialog attributes the restart to the field causing it, and omits the warning entirely for a restart-free change → Cancel keeps edits → confirm → form locks with a live countdown → cancel inside the window reverts and says the machine is unchanged → cancel after it shows "too late", not an error → mock completes → form unlocks with new current values; a change from a second window updates the first live; a stale-version apply shows what changed instead of clobbering it |
 | 7 | Reliability | Outbox for alert responses, alert persistence + revocation, draft persistence, burst coalescing | Answer an alert with the mock stopped → restart → the answer arrives exactly once; an apply that fails offline is **not** replayed later; alerts survive a window reload without re-notifying; revoking an alert removes it from the view; 10 alerts at once produce one notification and 10 view entries |
 | 8 | Tests | Unit (parser, backoff, token resolution, outbox, validation) + `@vscode/test-electron` integration (commands registered, view container resolves, webview view renders) + manual matrix incl. a narrow sidebar and high-contrast theme | CI green on Linux/macOS/Windows |
 | 9 | Packaging & version skew | `vsce package`, README with install instructions, CHANGELOG, icon; `min_client_version` check with an actionable "update your .vsix" prompt | A `.vsix` installs cleanly on a machine that never had the dev setup; a deliberately old build shows the update prompt instead of failing obscurely |
@@ -764,7 +796,9 @@ conditions.
 | GPU list unreachable on a cold start | Form is unusable, not merely degraded | Cached list + explicit error state with Retry instead of an empty dropdown (§8.4) |
 | Lenient numeric parsing | Silently provisioning the wrong resources | Strict integer parser, no `parseInt`; server validates independently (§8.6) |
 | GPU type retired between render and apply | Machine reconfigured onto a dead type | `expected_version` on apply, violation on `spec.gpu_type_id` → refresh + clear selection, never substitute (§8.4) |
-| Accidental apply reconfigures a live machine | Lost running jobs, unplanned reboot | Non-suppressible confirmation dialog showing the diff and the server's restart warning (§8.7) |
+| Accidental apply reconfigures a live machine | Lost running jobs, unplanned reboot | Preview-driven, non-suppressible confirmation naming which edit forces the restart, plus the cancellation window (§8.7, §8.8) |
+| Client guesses whether a change restarts | Users warned wrongly, or not at all | Only the server decides; no dialog is shown if preview fails (§8.7) |
+| Clock skew hides or fakes the cancel window | Cancel button unusable on a machine with a wrong clock | Countdown rendered against tracked server time; client countdown is advisory (§8.8) |
 | Stale form reverts somebody else's change | Silent regression nobody notices | `expected_version` precondition → `ABORTED`, show what changed, never auto-reapply (§8.9) |
 | Offline apply replayed later from a queue | Machine reboots long after the user moved on | Applies are excluded from the outbox by design (§9.1) |
 | Remote dev has no route to the server | Extension silently dead | `extensionKind` + one remote test (§9.4) |
@@ -796,20 +830,13 @@ Two assumptions remain, both cheap for the backend to overturn:
 2. **The `none` option is server-supplied** with the reserved id `none`, so the backend
    words its label. The client synthesises it if absent, but logs a warning.
 
-And three questions the "applied directly" answer newly raises. None blocks Phase 1; the
-first two want answering before Phase 6b:
+Everything the "applied directly" answer raised is now answered too:
 
-3. **Does applying always restart the machine, or only for some changes?** The proto
-   carries `requires_restart` as a property of the config response, which assumes it is a
-   property of the machine. If it depends on *which* field changed — growing a disk being
-   cheap while swapping a GPU is not — then it belongs on a per-change preview instead,
-   and the confirmation dialog should say which of the user's specific edits force the
-   reboot.
-4. **Can an apply be cancelled once it is under way?** Right now the form simply locks
-   until the machine reports back. If the backend can abort a change in progress, that is
-   a `CancelMachineChange` RPC and a Cancel button in the applying state.
-5. **What happens to a machine mid-apply if the change fails?** Does it stay on the old
-   configuration, or can it land somewhere in between? The client currently shows
-   `failure_reason` and refreshes from the server, which is right either way — but if a
-   partial state is possible, the user should be told that explicitly rather than left to
-   infer it.
+| Question | Answer | Where it landed |
+|---|---|---|
+| Does applying always restart? | No — depends on the change | `PreviewMachineConfig`, §8.7 |
+| Can an apply be cancelled? | Yes, briefly after it starts | `CancelMachineChange`, `cancellable_until`, §8.8 |
+| What happens on failure? | Full revert to the old config | `ChangeStatus`, §8.8 |
+
+Nothing is currently blocking. The next decision is when to start building, and Phase 1
+depends on none of the above.

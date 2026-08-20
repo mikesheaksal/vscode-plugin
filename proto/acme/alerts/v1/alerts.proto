@@ -58,6 +58,31 @@ service AlertService {
     option (google.api.http) = {get: "/api/v1/machine/config"};
   }
 
+  // Computes what applying a spec would do, without doing it: whether it needs
+  // a restart, which specific edits force that, and any validation errors.
+  //
+  // Called immediately before the confirmation dialog, so the dialog states
+  // real consequences rather than guesses. Restarts are NOT required by every
+  // change, and only the server knows which ones need one. This doubles as
+  // pre-flight validation: the user should never confirm a change that is then
+  // rejected.
+  rpc PreviewMachineConfig(PreviewMachineConfigRequest) returns (PreviewMachineConfigResponse) {
+    option (google.api.http) = {
+      post: "/api/v1/machine/config:preview"
+      body: "*"
+    };
+  }
+
+  // Aborts a change that is still within its cancellation window
+  // (MachineChange.cancellable_until). Past that point the server returns
+  // FAILED_PRECONDITION and the change runs to completion.
+  rpc CancelMachineChange(CancelMachineChangeRequest) returns (CancelMachineChangeResponse) {
+    option (google.api.http) = {
+      post: "/api/v1/machine/changes/{change_id}:cancel"
+      body: "*"
+    };
+  }
+
   // Applies a new configuration to the machine directly — there is no approval
   // step. Idempotent on idempotency_key, and guarded by expected_version so a
   // form rendered from stale data cannot silently clobber a concurrent change.
@@ -266,15 +291,10 @@ message GetMachineConfigResponse {
   // rather than letting the user queue a second change on top of the first.
   optional MachineChange pending_change = 5;
 
-  // What the user is warned about before a change is applied. The client
-  // cannot know whether reconfiguring costs a reboot, so the server says.
-  // Shown in the confirmation dialog, which is not skippable when
-  // requires_restart is true.
-  bool requires_restart = 6;
-
-  // Optional extra sentence for the confirmation dialog, e.g. "Running jobs
-  // will be terminated."
-  string change_warning = 7;
+  // 6, 7 were a machine-wide requires_restart/change_warning pair. Whether a
+  // restart is needed depends on which fields change, not on the machine, so
+  // it moved to PreviewMachineConfigResponse.
+  reserved 6, 7;
 }
 
 message GpuType {
@@ -314,6 +334,62 @@ message ResourceLimits {
   uint32 ssd_gb_max = 8;
 }
 
+message PreviewMachineConfigRequest {
+  string client_id = 1;
+
+  // The complete desired configuration, exactly as it would be sent to
+  // ApplyMachineConfig.
+  ResourceSpec spec = 2;
+
+  string expected_version = 3;
+}
+
+message PreviewMachineConfigResponse {
+  // False when the spec is identical to the current configuration. The client
+  // disables Apply in that state anyway, so this is a backstop.
+  bool has_changes = 1;
+
+  // True when applying this particular spec restarts the machine. Not a
+  // property of the machine: growing a disk may be free where swapping an
+  // accelerator is not.
+  bool requires_restart = 2;
+
+  // One per field the user changed, so the confirmation dialog can name which
+  // specific edit forces the restart rather than warning about the change as
+  // an undifferentiated whole.
+  repeated ChangeEffect effects = 3;
+
+  // Optional extra sentence for the dialog, e.g. "Running jobs will be
+  // terminated."
+  string warning = 4;
+
+  // How long the change will be cancellable once started, so the dialog can
+  // set expectations before the user commits. Zero means not cancellable.
+  uint32 cancellation_window_seconds = 5;
+}
+
+message ChangeEffect {
+  // Proto path of the changed field, e.g. "spec.ram_gb". Matches the paths
+  // used in google.rpc.BadRequest violations, so the client has one mapping
+  // from path to input.
+  string field_path = 1;
+
+  // Human-readable, shown beside the field's before/after in the dialog,
+  // e.g. "Requires a restart".
+  string description = 2;
+
+  bool requires_restart = 3;
+}
+
+message CancelMachineChangeRequest {
+  string change_id = 1;
+  string client_id = 2;
+}
+
+message CancelMachineChangeResponse {
+  MachineChange change = 1;
+}
+
 message ApplyMachineConfigRequest {
   string client_id = 1;
 
@@ -336,6 +412,10 @@ message ApplyMachineConfigRequest {
 
 message ApplyMachineConfigResponse {
   MachineChange change = 1;
+
+  // Anchor for rendering the cancellation countdown without depending on how
+  // recently a heartbeat arrived.
+  google.protobuf.Timestamp server_time = 2;
 }
 
 message MachineChange {
@@ -347,8 +427,19 @@ message MachineChange {
 
   google.protobuf.Timestamp started_at = 4;
 
+  // Deadline for CancelMachineChange. Absent when the change was never
+  // cancellable or the window has closed. The client renders a countdown from
+  // this, corrected for clock skew against the server time it tracks from
+  // heartbeats — and treats its own countdown as advisory, since the server
+  // is the authority on whether a cancel arrived in time.
+  optional google.protobuf.Timestamp cancellable_until = 7;
+
   // Set when status is FAILED. Shown to the user verbatim, so it should read
   // as an explanation rather than a stack trace.
+  //
+  // A failed or cancelled change leaves the machine on its previous
+  // configuration — the server reverts, and there is no partial state for the
+  // client to represent or the user to untangle.
   string failure_reason = 5;
 
   // Deep link to the change record, offered as an "Open" button on the
@@ -373,5 +464,14 @@ enum ChangeStatus {
   CHANGE_STATUS_UNSPECIFIED = 0;
   CHANGE_STATUS_APPLYING = 1;
   CHANGE_STATUS_APPLIED = 2;
+
+  // Machine is back on its previous configuration.
   CHANGE_STATUS_FAILED = 3;
+
+  // Cancel accepted, revert in progress.
+  CHANGE_STATUS_CANCELLING = 4;
+
+  // Cancelled and reverted. Terminal, and indistinguishable from FAILED in
+  // its effect on the machine — the distinction is whose decision it was.
+  CHANGE_STATUS_CANCELLED = 5;
 }
