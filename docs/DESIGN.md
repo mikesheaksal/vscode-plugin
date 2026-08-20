@@ -9,9 +9,9 @@ A VS Code extension that connects to a backend and does two things:
 
 1. **Alerts.** The server pushes an alert; the extension shows it to the user with one or
    two action buttons; the user's choice (or dismissal) is posted back to the server.
-2. **Form.** A permanent icon in the Activity Bar opens a sidebar containing a form with
-   a small fixed set of fields plus Submit/Cancel; the submitted payload is posted to the
-   server.
+2. **Form.** A permanent icon in the Activity Bar opens a sidebar containing a compute
+   resource request form — GPU type and count, CPU cores, RAM, SSD — whose payload is
+   posted to the server.
 
 Everything else in this document exists to make those two flows reliable when the
 network drops, the token expires, or the user has six windows open.
@@ -22,7 +22,7 @@ network drops, the token expires, or the user has six windows open.
 |---|---|---|
 | IDE | VS Code extension, TypeScript / Node | `.vsix` package; no VSIX/C# work |
 | Server → client transport | **SSE**, long-poll fallback | Push latency without a WebSocket; survives most corporate proxies |
-| Form fields | **Hardcoded** in the extension | Simple and type-safe; field changes require a new release |
+| Form fields | **Hardcoded** in the extension, except GPU Type's options | Simple and type-safe; field changes require a new release, GPU list does not (§5.4) |
 | Auth | **API token from settings**, fallback to a known local file | No IdP work; token handling needs care (§6) |
 | Entry point | **Activity Bar container** with a form view and an alerts view | Permanent icon in the left strip; form is one click away (§3) |
 
@@ -89,7 +89,8 @@ grey rectangle.
 
 - Command Palette: `Acme Alerts: New Request`, `Acme Alerts: Sign In`,
   `Acme Alerts: Show Log`. Free, and how power users will actually reach the feature.
-- View title bar buttons (`menus: view/title`): refresh, and "Open in Editor" (§8.2).
+- View title bar buttons (`menus: view/title`): refresh the GPU list, and "Open in
+  Editor" (§8.8).
 - A status bar item is **no longer needed** for the unread count — the Activity Bar badge
   covers it. Optional later if we want a persistent connection-status indicator.
 
@@ -105,7 +106,8 @@ disagree can hide it via right-click → Hide, so the escape hatch exists.
 The sidebar defaults to roughly 300px. A handful of stacked fields fits comfortably; a
 long free-text field is cramped. The design accounts for this with a single-column layout
 that degrades gracefully, and an "Open in Editor" action that reopens the same form as a
-full-width editor panel (§8.2).
+full-width editor panel (§8.8). With only five short fields the sidebar is in practice
+adequate, so this is an escape hatch rather than a load-bearing part of the design.
 
 ## 4. Architecture
 
@@ -188,29 +190,81 @@ an already-answered alert returns `409`, which the client logs and ignores (§9.
 
 ### 5.3 Form submission (client → server)
 
-`POST /api/v1/forms/feedback/submissions` with header `Idempotency-Key: <uuid v4>`
+`POST /api/v1/forms/resource-request/submissions` with header `Idempotency-Key: <uuid v4>`
 
 ```json
 {
-  "title": "Search is slow on large repos",
-  "category": "bug",
-  "priority": "high",
-  "description": "...",
+  "gpuType": "h100-80",
+  "gpuCount": 4,
+  "cpuCores": 32,
+  "ramGb": 256,
+  "ssdGb": 1024,
   "clientContext": {
     "extensionVersion": "0.1.0",
     "vscodeVersion": "1.9x.x",
-    "platform": "linux"
+    "platform": "linux",
+    "optionsEtag": "W/\"g7c1\""
   }
 }
 ```
 
-Response `201 { "id": "sub_...", "url": "https://..." }` — the client shows a
-notification with an "Open" button linking to `url`.
+Field contract:
 
-The field set above is a **placeholder**. Since fields are hardcoded, the real list needs
-to be pinned down before Phase 6; see §12.
+| Field | Key | Type | Range | Required |
+|---|---|---|---|---|
+| GPU Type | `gpuType` | string id from `/form-options` | any returned id, incl. `none` | yes |
+| Number of GPUs | `gpuCount` | integer | 1–8, or the option's `maxCount` | **only when** `gpuType != "none"` |
+| CPU cores | `cpuCores` | integer | 1–256 | yes |
+| RAM | `ramGb` | integer, GB | 1–2048 | yes |
+| SSD | `ssdGb` | integer, GB | 1–2048 | yes |
 
-### 5.4 Errors
+`gpuCount` is **omitted entirely** when `gpuType` is `none` — not sent as `0` or `null`.
+A request with `gpuType: "none"` and a `gpuCount` present is a client bug, and the server
+should reject it with `422` rather than silently ignoring the field. Being strict here
+means a future bug in the conditional logic surfaces immediately instead of quietly
+provisioning the wrong thing.
+
+`optionsEtag` lets the server see which version of the GPU list the client was rendering,
+which turns "user picked a type we just retired" from a mystery into a one-line diagnosis.
+
+Response `201 { "id": "req_...", "url": "https://..." }` — the client shows a notification
+with an "Open" button linking to `url`.
+
+Relevant `422` codes: `invalid_gpu_type` (unknown or retired id), `gpu_count_not_allowed`
+(sent with `none`), `gpu_count_out_of_range` (exceeds that type's `maxCount`),
+`out_of_range` (any numeric field). All are handled by §8.7.
+
+### 5.4 Form options (server → client)
+
+The one piece of the form that is not hardcoded.
+
+`GET /api/v1/form-options` with `If-None-Match: <etag>` → `304` when unchanged.
+
+```json
+{
+  "gpuTypes": [
+    { "id": "none",    "label": "No GPU",            "maxCount": 0 },
+    { "id": "a100-40", "label": "NVIDIA A100 40GB",  "maxCount": 8 },
+    { "id": "h100-80", "label": "NVIDIA H100 80GB",  "maxCount": 4 }
+  ]
+}
+```
+
+Two deliberate choices:
+
+- **The `none` option is server-supplied**, with the reserved id `none`, so its label is
+  the backend's to word ("No GPU", "CPU only", …). The client still synthesises it if the
+  server omits it, because a form with no way to say "no GPU" is broken — but that path
+  logs a warning, since it means the contract was not honoured.
+- **`maxCount` is per option.** A blanket 1–8 is almost certainly wrong: node topologies
+  differ per accelerator, and hard-coding 8 in the extension means shipping a release to
+  correct it. The client clamps to `min(maxCount, 8)` and falls back to 8 if the field is
+  absent, so a server that never sends `maxCount` still behaves exactly as specified.
+
+Order is preserved as sent — the backend controls what appears first. The client does not
+re-sort.
+
+### 5.5 Errors
 
 Single shape for every non-2xx, so the client has one error path:
 
@@ -337,53 +391,142 @@ session; the draft-persistence mechanism below already makes teardown invisible 
 user, and it is the same mechanism we need for a window reload anyway. One state
 mechanism, not two.
 
-- Fields are hardcoded in one module (`form/fields.ts`) as a typed const, so the renderer,
-  the validator and the request body all derive from a single declaration. Even in a
-  hardcoded design this is what keeps a later server-driven schema a contained change
-  rather than a rewrite.
 - Rendering: plain HTML using `var(--vscode-*)` CSS variables — specifically the
   `--vscode-sideBar-*` and `--vscode-input-*` families — so it matches the user's theme in
-  light, dark and high-contrast for free. No UI framework; the form is small enough that
-  React would be more build tooling than payoff.
-- Layout is single-column and fluid, with no fixed pixel widths, so it survives the
-  sidebar being dragged narrow. Labels sit above inputs rather than beside them.
+  light, dark and high-contrast for free. No UI framework; five fields do not justify
+  React's build tooling.
+- Layout is single-column and fluid with labels above inputs, so it survives the sidebar
+  being dragged narrow.
 - CSP: `default-src 'none'; style-src ${webview.cspSource}; script-src 'nonce-${nonce}';`
   with `localResourceRoots` limited to `media/`.
 - Message protocol:
   - webview → extension: `{ type: 'submit', payload }`, `{ type: 'draft', payload }`,
-    `{ type: 'cancel' }`
-  - extension → webview: `{ type: 'init', draft }`, `{ type: 'busy', value }`,
-    `{ type: 'result', ok, error? }`
+    `{ type: 'refreshOptions' }`
+  - extension → webview: `{ type: 'init', draft, options, optionsState }`,
+    `{ type: 'busy', value }`, `{ type: 'result', ok, error?, fieldErrors? }`
 
-### 8.2 "Open in Editor"
+### 8.2 The fields
 
-A button in the view title bar reopens the same form as a full-width
-`WebviewPanel` in the editor area, for users who want room to write. The two hosts share
-one HTML generator, one message handler and one draft — only the shell differs, so this
-costs well under a hundred lines. The draft transfers, so the switch is seamless
-mid-typing.
+Declared once in `form/fields.ts` as a typed const; the renderer, the client-side
+validator and the request body all derive from that single declaration. Even in a
+hardcoded design this is what keeps a later server-driven schema a contained change rather
+than a rewrite.
 
-### 8.3 Draft persistence
+| Field | Control | Range | Notes |
+|---|---|---|---|
+| GPU Type | `<select>` | options from `/form-options` | Options are dynamic; the field itself is not |
+| Number of GPUs | `<select>` 1…N | 1–`maxCount` (≤8) | Hidden when GPU Type is `none` |
+| CPU cores | text, `inputmode="numeric"` | 1–256 | |
+| RAM (GB) | text, `inputmode="numeric"` | 1–2048 | |
+| SSD (GB) | text, `inputmode="numeric"` | 1–2048 | |
+
+Two control choices worth justifying:
+
+- **GPU count is a `<select>`, not a number input.** The range is at most eight discrete
+  values, it is regenerated whenever GPU Type changes (because `maxCount` is per type), and
+  a dropdown makes an out-of-range value unrepresentable rather than merely rejected.
+- **The other three are `type="text"` with `inputmode="numeric"`, not `type="number"`.**
+  `type="number"` has two properties that hurt here: its `.value` is the empty string when
+  the user types something unparseable, so we cannot echo back what they actually typed;
+  and its scroll-wheel behaviour silently changes the value when a user scrolls the
+  sidebar with the cursor over the field. Reading raw text and validating it ourselves
+  avoids both. `inputmode="numeric"` still gets the numeric keypad where that applies.
+
+### 8.3 Conditional logic for GPU count
+
+Rules, in the order they matter:
+
+1. GPU Type is `none` → the count field is **hidden** (not merely disabled) and `gpuCount`
+   is omitted from the payload.
+2. GPU Type changes to a type whose `maxCount` is lower than the current selection → the
+   count is clamped down to `maxCount`, with a one-line inline note explaining why, rather
+   than silently changing a number the user chose.
+3. Switching to `none` and back **restores the previous count** from the draft. Hidden
+   fields keep their draft value; they are simply excluded from the payload. Losing a
+   user's input because they toggled a dropdown twice is the kind of small betrayal that
+   makes people distrust a form.
+
+The extension re-derives all of this before POSTing. The webview decides what to *show*;
+it never decides what to *send*.
+
+### 8.4 GPU options: fetching, caching, and failure
+
+The GPU list is the form's one external dependency, and it is on the critical path — a
+user who cannot see the list cannot fill the form at all. So:
+
+- **Cached** in `globalState` alongside its ETag. On open, the form renders from cache
+  **immediately** and revalidates in the background with `If-None-Match`; a `304` costs
+  nothing and a `200` swaps the list in place, preserving the current selection if its id
+  still exists.
+- **Refreshed** on: first activation, view becoming visible when the cache is older than
+  15 minutes, an explicit refresh button in the view title, and after any
+  `invalid_gpu_type` rejection.
+- **Cold start with no cache and a failed fetch** → the form renders in an explicit error
+  state ("Couldn't load GPU types") with a Retry button, and Submit disabled. Not an empty
+  dropdown, and not a form the user fills in before discovering it cannot be sent.
+- **Stale cache with a failed refresh** → the form stays usable with a quiet inline notice
+  that the list may be out of date. Degraded beats blocked; the server validates
+  `gpuType` on submit anyway, so a retired id fails loudly at the only point where it
+  matters.
+- **The selected id disappears** from a refreshed list → the selection is cleared and the
+  field is marked with "This GPU type is no longer available." Silently substituting a
+  different accelerator would be the worst possible behaviour here.
+
+### 8.5 Draft persistence
 
 The webview posts a debounced `draft` message on every change; the extension stores it in
 `workspaceState` and replays it in `init`. This covers all four ways the form can go away:
 collapsing the view, switching Activity Bar containers, closing the editor panel, and
-reloading the window.
+reloading the window. The draft holds raw strings, not parsed numbers, so a half-typed
+`12` in the RAM field survives a reload as `12` rather than being dropped for failing
+validation.
 
-### 8.4 Validation and submit
+### 8.6 Validation
 
-**Validation runs twice on the client:** in the webview for immediate feedback (disabled
-Submit, inline messages), and again in the extension before the POST, because a webview is
-not a trustworthy input source. The server validates a third time and is authoritative.
+**Validation runs twice on the client**: in the webview for immediate feedback (inline
+messages, disabled Submit), and again in the extension before the POST, because a webview
+is not a trustworthy input source. The server validates a third time and is authoritative.
 
-Submit flow: disable the form → POST with an `Idempotency-Key` generated once per
-submission attempt → on success clear the draft, reset the form, show a confirmation
-notification with an "Open" button linking to the created record → on failure re-enable
-the form with the error shown inline and offer to queue it in the outbox.
+The three free-text numerics share one strict parser:
 
-Note the difference from the old panel design: on success the sidebar view **resets in
-place** rather than closing, because there is nothing to close. That is a better outcome —
-the user sees an empty ready form rather than a disappearing panel.
+```ts
+const asInt = (raw: string): number | undefined => {
+  const t = raw.trim();
+  if (!/^\d+$/.test(t)) return undefined;   // rejects "", "1.5", "1e3", "0x10", "-1", "12abc"
+  const n = Number(t);
+  return Number.isSafeInteger(n) ? n : undefined;
+};
+```
+
+`parseInt` is deliberately avoided: it accepts `"12abc"` as `12` and `"0x10"` as `16`,
+which is exactly the class of silent misprovisioning we do not want. Range checks then
+apply per field, with messages naming the bound ("RAM must be between 1 and 2048 GB").
+
+Validation fires on blur and on submit, not on every keystroke — flagging `1` as invalid
+while someone is still typing `128` trains users to ignore the error text.
+
+### 8.7 Submit
+
+Disable the form → validate in the extension → POST with an `Idempotency-Key` generated
+once per submission attempt → on success clear the draft, reset the form to defaults, show
+a confirmation notification with an "Open" button linking to the created record.
+
+On `422`, map the server's field-level codes back onto the specific inputs via
+`fieldErrors` so the user sees the problem next to the field rather than in a generic
+banner. On network failure, re-enable the form and offer to queue the submission in the
+outbox (§9.1).
+
+On success the sidebar view **resets in place** rather than closing, since there is
+nothing to close — the user is left looking at an empty ready form, which is the right
+resting state for something people submit repeatedly.
+
+### 8.8 "Open in Editor"
+
+A button in the view title bar reopens the same form as a full-width `WebviewPanel` in the
+editor area. The two hosts share one HTML generator, one message handler and one draft —
+only the shell differs. With five short fields the sidebar is genuinely adequate, so this
+is a convenience rather than a necessity; it is cheap enough to keep, and it is the escape
+hatch if field count grows.
 
 ## 9. Reliability
 
@@ -439,10 +582,10 @@ Each phase is independently demoable. Phases 3–5 assume the mock server from P
 | 0 | Contract | This document + an OpenAPI file agreed with the backend team | Both sides sign off on §5 |
 | 1 | Skeleton | `yo code` scaffold, TS strict, ESLint, `onStartupFinished` activation, Activity Bar container + icon, placeholder views, output channel, settings contributed | F5 opens a dev host; the Activity Bar icon appears and opens a sidebar with both views |
 | 2 | Config & auth | `ConfigService` with the three-source resolution, SecretStorage migration, Sign In command, redacting logger | Unit tests cover all three sources + precedence + 401 invalidation |
-| 3 | API client + mock | `ApiClient` (auth, timeout, retry, typed errors) and a ~150-line Express mock server with a CLI to push alerts | `GET /me` succeeds against the mock; every error code maps correctly |
+| 3 | API client + mock | `ApiClient` (auth, timeout, retry, typed errors) and a ~150-line Express mock server: `/me`, `/form-options` with ETag support, submission endpoint, and a CLI to push alerts | `GET /me` succeeds against the mock; a second `/form-options` call returns `304`; every error code maps correctly |
 | 4 | Alerts via polling | `AlertService`: catch-up poll, notification with 1–2 buttons, response POST, dedupe set; `AlertTreeProvider` with inline action buttons, badge and welcome states | Push an alert from the mock CLI → it appears in both the notification and the view, badge increments, answering either way records once |
 | 5 | SSE | `EventStream`: hand-rolled parser, heartbeat, jittered backoff, `Last-Event-ID` resume, long-poll fallback | Kill the mock mid-stream → client reconnects and receives an alert queued during the outage |
-| 6 | Form | `WebviewView` in the sidebar, hardcoded fields, CSP + nonce, theme variables, validation, submit, "Open in Editor" panel sharing the same code | Open from the Activity Bar → fill → submit → mock records the payload; invalid input blocks Submit; collapsing the view and returning preserves the draft |
+| 6 | Form | `WebviewView` in the sidebar, the five fields, options fetch + cache + error states, conditional GPU count, strict validation, submit, "Open in Editor" | Open from the Activity Bar → fill → submit → mock records the payload; `none` omits `gpuCount`; toggling to `none` and back restores the count; `1e3` and `12abc` are rejected; cold start with the mock down shows Retry, not an empty dropdown; collapsing the view preserves the draft |
 | 7 | Reliability | Outbox, draft persistence, alert-burst coalescing, 409 handling | Submit with the mock stopped → restart mock → submission arrives exactly once; 10 alerts at once produce one notification and 10 view entries |
 | 8 | Tests | Unit (parser, backoff, token resolution, outbox, validation) + `@vscode/test-electron` integration (commands registered, view container resolves, webview view renders) + manual matrix incl. a narrow sidebar and high-contrast theme | CI green on Linux/macOS/Windows |
 | 9 | Packaging | `vsce package`, README, CHANGELOG, icon, telemetry opt-out honoured | A `.vsix` installs cleanly on a machine that never had the dev setup |
@@ -457,26 +600,48 @@ conditions.
 | Risk | Impact | Mitigation |
 |---|---|---|
 | Activity Bar slot is intrusive for low-frequency users | Users hide the container and stop seeing alerts | Notifications remain the primary alert channel and work with the container hidden (§3.5) |
-| Sidebar too narrow for comfortable typing | Users avoid the form | Fluid single-column layout plus "Open in Editor" (§8.2) |
-| `WebviewView` torn down when hidden | Lost input, reported as a data-loss bug | Draft persistence on every change, tested explicitly in Phase 6 (§8.3) |
+| Sidebar too narrow for comfortable typing | Users avoid the form | Five short fields fit; fluid single-column layout plus "Open in Editor" (§8.8) |
+| `WebviewView` torn down when hidden | Lost input, reported as a data-loss bug | Draft persistence on every change, tested explicitly in Phase 6 (§8.5) |
 | Corporate proxy buffers SSE | Alerts arrive minutes late or never | Correct response headers; long-poll fallback; test behind the real proxy in Phase 5 |
 | Token in `settings.json` leaks via Settings Sync or a commit | Credential exposure | Application-scoped setting, SecretStorage migration, redacting logger (§6.2) |
 | Notification bursts | Users miss alerts | Coalescing into one notification + the alerts view and its badge (§7.3) |
 | Duplicate alerts across windows | Ghost notifications | Dedupe + `409` handling (§9.3) |
-| Hardcoded fields change | New release + user updates for every field tweak | Single `fields.ts` declaration keeps the later schema migration contained (§8) |
+| Hardcoded fields change | New release + user updates for every field tweak | Single `fields.ts` declaration keeps the later schema migration contained (§8.2) |
+| GPU list unreachable on a cold start | Form is unusable, not merely degraded | Cached list + explicit error state with Retry instead of an empty dropdown (§8.4) |
+| Lenient numeric parsing | Silently provisioning the wrong resources | Strict integer parser, no `parseInt`; server validates independently (§8.6) |
+| GPU type retired between render and submit | Request provisioned against a dead type | `optionsEtag` on submit, `invalid_gpu_type` → refresh + clear selection, never substitute (§8.4) |
 | Remote dev has no route to the server | Extension silently dead | `extensionKind` + one remote test (§9.4) |
 
 ## 12. Open questions
 
-1. **Form fields.** The exact list, types, validation rules, and which are required. §5.3
-   is a placeholder standing in until this is answered — it blocks Phase 6, nothing earlier.
-2. **Alert lifetime.** Should an unanswered alert expire client-side and report `expired`,
+Resolved: the form fields are specified in §5.3 and §8.2. Phase 6 is unblocked.
+
+Assumptions made while specifying them — each is a decision the backend can overturn
+cheaply, but they are decisions, so they are listed rather than buried:
+
+1. **`maxCount` is per GPU type**, defaulting to 8 when the server omits it (§5.4). If the
+   limit really is a flat 1–8 across every accelerator, the field can be dropped and
+   nothing else changes.
+2. **The `none` option comes from the server** with the reserved id `none`. The client
+   synthesises it if absent, but logs a warning.
+3. **RAM and SSD accept any integer** in 1–2048 GB. If the backend only provisions certain
+   increments (powers of two, multiples of 8), say so and the controls become steppers or
+   dropdowns — better to constrain the input than to reject it after the fact.
+4. **No defaults.** Every field starts empty and the user fills all of them. If there is a
+   common configuration worth pre-filling, a default set would measurably reduce effort.
+5. **No cross-field limits.** Nothing currently stops 1 CPU core with 2048 GB of RAM, or
+   8 H100s with 1 core. If the backend enforces ratios or per-user quotas, the client
+   should know them so it can warn before submission rather than after.
+
+Still open:
+
+6. **Alert lifetime.** Should an unanswered alert expire client-side and report `expired`,
    or persist until answered across restarts?
-3. **Server-side routing.** How does the server decide *which* user gets an alert — is
+7. **Server-side routing.** How does the server decide *which* user gets an alert — is
    there a user registry, or does the client announce itself on connect?
-4. **Distribution.** Public Marketplace, a private/internal gallery, or a `.vsix` file
+8. **Distribution.** Public Marketplace, a private/internal gallery, or a `.vsix` file
    passed around? This changes the update story and whether we need a version check.
-5. **Multiple submissions.** May a user have several forms in flight, or is one at a time
-   sufficient? The single sidebar form view in §8 assumes one at a time.
-6. **Telemetry.** Any requirement to report delivery/response metrics beyond what the
-   server already sees?
+9. **Multiple submissions.** May a user have several requests in flight, or is one at a
+   time sufficient? The single sidebar form view in §8 assumes one at a time.
+10. **Telemetry.** Any requirement to report delivery/response metrics beyond what the
+    server already sees?
