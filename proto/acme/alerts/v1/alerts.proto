@@ -51,17 +51,22 @@ service AlertService {
     };
   }
 
-  // Everything the form needs to render: the GPU catalogue, the client's
-  // current allocation (used as the form's default values), and the numeric
-  // bounds. One call, so the form cannot render half-configured.
-  rpc GetFormConfig(GetFormConfigRequest) returns (GetFormConfigResponse) {
-    option (google.api.http) = {get: "/api/v1/form-config"};
+  // Everything the form needs to render: the GPU catalogue, the machine's
+  // current configuration, the numeric bounds, and any change already in
+  // flight. One call, so the form cannot render half-configured.
+  rpc GetMachineConfig(GetMachineConfigRequest) returns (GetMachineConfigResponse) {
+    option (google.api.http) = {get: "/api/v1/machine/config"};
   }
 
-  // Submits a requested resource configuration. Idempotent on idempotency_key.
-  rpc SubmitResourceRequest(SubmitResourceRequestRequest) returns (SubmitResourceRequestResponse) {
+  // Applies a new configuration to the machine directly — there is no approval
+  // step. Idempotent on idempotency_key, and guarded by expected_version so a
+  // form rendered from stale data cannot silently clobber a concurrent change.
+  //
+  // Returns as soon as the change is accepted; completion arrives as a
+  // MachineConfigChanged event on the stream.
+  rpc ApplyMachineConfig(ApplyMachineConfigRequest) returns (ApplyMachineConfigResponse) {
     option (google.api.http) = {
-      post: "/api/v1/resource-requests"
+      post: "/api/v1/machine/config:apply"
       body: "*"
     };
   }
@@ -121,6 +126,11 @@ message Event {
     // Sent every 25s so the client can distinguish a quiet server from a
     // half-open connection. Carries no meaning beyond its arrival.
     Heartbeat heartbeat = 4;
+
+    // A configuration change finished applying, failed, or was made by
+    // somebody else. The form refreshes its current values from this rather
+    // than polling.
+    MachineConfigChanged machine_config_changed = 5;
   }
 }
 
@@ -223,17 +233,18 @@ enum AlertOutcome {
 }
 
 // ---------------------------------------------------------------------------
-// Resource request form
+// Machine configuration
 // ---------------------------------------------------------------------------
 
-message GetFormConfigRequest {
+message GetMachineConfigRequest {
   string client_id = 1;
 }
 
-message GetFormConfigResponse {
-  // Opaque; echoed back on submit so a request made against a stale catalogue
-  // is diagnosable in one step. Also usable as the ETag value if the gateway
-  // is later configured to serve conditional requests.
+message GetMachineConfigResponse {
+  // Opaque version of the machine's configuration state. Echoed back as
+  // ApplyMachineConfigRequest.expected_version; the server rejects a mismatch.
+  // This is what stops a form left open for an hour from reverting a change
+  // somebody made in the meantime.
   string version = 1;
 
   // Rendered in the order given; the client does not re-sort. Must include the
@@ -241,14 +252,29 @@ message GetFormConfigResponse {
   // warning: a form with no way to say "no GPU" is broken.
   repeated GpuType gpu_types = 2;
 
-  // The client's current allocation, used to pre-fill the form. Absent for a
-  // client that has none, in which case the form starts empty.
+  // The machine's current configuration. This is what the form is pre-filled
+  // with and what "changed" is measured against. Absent only for a machine
+  // that has never been configured.
   optional ResourceSpec current = 3;
 
   // Absent means the documented defaults apply: 1-256 cores, 1-2048 GB RAM,
   // 1-2048 GB SSD, 1-8 GPUs. Sending them explicitly means a bound can change
   // without shipping a new .vsix.
   optional ResourceLimits limits = 4;
+
+  // Set while a change is applying. The client renders the form read-only
+  // rather than letting the user queue a second change on top of the first.
+  optional MachineChange pending_change = 5;
+
+  // What the user is warned about before a change is applied. The client
+  // cannot know whether reconfiguring costs a reboot, so the server says.
+  // Shown in the confirmation dialog, which is not skippable when
+  // requires_restart is true.
+  bool requires_restart = 6;
+
+  // Optional extra sentence for the confirmation dialog, e.g. "Running jobs
+  // will be terminated."
+  string change_warning = 7;
 }
 
 message GpuType {
@@ -288,34 +314,64 @@ message ResourceLimits {
   uint32 ssd_gb_max = 8;
 }
 
-message SubmitResourceRequestRequest {
+message ApplyMachineConfigRequest {
   string client_id = 1;
+
+  // The complete desired configuration, not a delta. The server diffs it
+  // against what is current; sending the whole spec means an old client and a
+  // new server cannot disagree about which fields were "left alone".
   ResourceSpec spec = 2;
 
-  // Generated once per submission attempt and reused across retries, so a
-  // response lost to a dropped connection can be replayed safely.
+  // Generated once per apply attempt and reused across retries, so a response
+  // lost to a dropped connection can be replayed safely.
   string idempotency_key = 3;
 
-  // GetFormConfigResponse.version the form was rendered from. Turns "the user
-  // picked a GPU type we retired an hour ago" into a one-line diagnosis.
-  string form_config_version = 4;
+  // GetMachineConfigResponse.version the form was rendered from. A mismatch is
+  // ABORTED (409) and the client refetches and shows what changed, rather than
+  // overwriting it.
+  string expected_version = 4;
 
   string client_version = 5;
 }
 
-message SubmitResourceRequestResponse {
-  string request_id = 1;
-
-  // Deep link to the created record, offered to the user as an "Open" button
-  // on the confirmation notification. Optional.
-  string url = 2;
-
-  RequestStatus status = 3;
+message ApplyMachineConfigResponse {
+  MachineChange change = 1;
 }
 
-enum RequestStatus {
-  REQUEST_STATUS_UNSPECIFIED = 0;
-  REQUEST_STATUS_PENDING = 1;
-  REQUEST_STATUS_APPLIED = 2;
-  REQUEST_STATUS_REJECTED = 3;
+message MachineChange {
+  string change_id = 1;
+  ChangeStatus status = 2;
+
+  // The configuration being applied.
+  ResourceSpec spec = 3;
+
+  google.protobuf.Timestamp started_at = 4;
+
+  // Set when status is FAILED. Shown to the user verbatim, so it should read
+  // as an explanation rather than a stack trace.
+  string failure_reason = 5;
+
+  // Deep link to the change record, offered as an "Open" button on the
+  // completion notification. Optional.
+  string url = 6;
+}
+
+message MachineConfigChanged {
+  // The configuration now in effect.
+  ResourceSpec current = 1;
+
+  // New config version, to be used as expected_version on the next apply.
+  string version = 2;
+
+  // The change that produced this state. Absent when the change originated
+  // outside this client, which is exactly when the client most needs to know
+  // its form is stale.
+  optional MachineChange change = 3;
+}
+
+enum ChangeStatus {
+  CHANGE_STATUS_UNSPECIFIED = 0;
+  CHANGE_STATUS_APPLYING = 1;
+  CHANGE_STATUS_APPLIED = 2;
+  CHANGE_STATUS_FAILED = 3;
 }

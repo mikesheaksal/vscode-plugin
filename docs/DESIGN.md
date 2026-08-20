@@ -9,9 +9,11 @@ A VS Code extension that connects to a backend and does two things:
 
 1. **Alerts.** The server pushes an alert; the extension shows it to the user with one or
    two action buttons; the user's choice (or dismissal) is posted back to the server.
-2. **Form.** A permanent icon in the Activity Bar opens a sidebar containing a compute
-   resource request form — GPU type and count, CPU cores, RAM, SSD — whose payload is
-   posted to the server.
+2. **Machine configuration.** A permanent icon in the Activity Bar opens a sidebar showing
+   the machine's current configuration — GPU type and count, CPU cores, RAM, SSD — as an
+   editable form. Applying a change reconfigures the machine **directly**; there is no
+   approval step, which is why §8 spends as much space on confirmation and concurrency as
+   on rendering fields.
 
 Everything else in this document exists to make those two flows reliable when the
 network drops, the token expires, or the user has six windows open.
@@ -28,6 +30,7 @@ network drops, the token expires, or the user has six windows open.
 | Distribution | **`.vsix` passed around** | No auto-update, so version skew is a first-class concern (Phase 9) |
 | Telemetry | **None** | The extension reports nothing beyond the six RPCs |
 | Form fields | **Hardcoded** in the extension, except GPU Type's options | Simple and type-safe; field changes require a new release, GPU list does not (§5.4) |
+| Form semantics | **Edit the current machine**, applied directly by the backend | Destructive: needs confirmation + optimistic concurrency (§8.7, §8.9) |
 | Auth | **API token from settings**, fallback to a known local file | No IdP work; token handling needs care (§6) |
 | Entry point | **Activity Bar container** with a form view and an alerts view | Permanent icon in the left strip; form is one click away (§3) |
 
@@ -51,7 +54,7 @@ user-facing feature rather than an occasional utility, that is the placement we 
   },
   "views": {
     "acmeAlerts": [
-      { "id": "acmeAlerts.form",    "name": "New Request", "type": "webview" },
+      { "id": "acmeAlerts.machine", "name": "Machine",     "type": "webview" },
       { "id": "acmeAlerts.pending", "name": "Alerts",      "type": "tree"    }
     ]
   }
@@ -60,9 +63,10 @@ user-facing feature rather than an occasional utility, that is the placement we 
 
 Two views inside one container:
 
-- **`acmeAlerts.form`** — a `WebviewView` rendering the form *inside the sidebar*. One
-  click on the Activity Bar icon and the user is looking at the form; there is no
-  intermediate panel to open. This is the primary surface.
+- **`acmeAlerts.machine`** — a `WebviewView` rendering the machine configuration form
+  *inside the sidebar*. One click on the Activity Bar icon and the user is looking at
+  their machine's current settings; there is no intermediate panel to open. This is the
+  primary surface.
 - **`acmeAlerts.pending`** — a `TreeView` listing outstanding and recently answered
   alerts. This is not decoration: it is what makes alerts recoverable when a notification
   is missed or auto-dismissed, and it replaces the QuickPick workaround for alert bursts
@@ -92,10 +96,10 @@ grey rectangle.
 
 ### 3.4 Secondary entry points
 
-- Command Palette: `Acme Alerts: New Request`, `Acme Alerts: Sign In`,
+- Command Palette: `Acme Alerts: Show Machine`, `Acme Alerts: Sign In`,
   `Acme Alerts: Show Log`. Free, and how power users will actually reach the feature.
 - View title bar buttons (`menus: view/title`): refresh the GPU list, and "Open in
-  Editor" (§8.8).
+  Editor" (§8.10).
 - A status bar item is **no longer needed** for the unread count — the Activity Bar badge
   covers it. Optional later if we want a persistent connection-status indicator.
 
@@ -111,7 +115,7 @@ disagree can hide it via right-click → Hide, so the escape hatch exists.
 The sidebar defaults to roughly 300px. A handful of stacked fields fits comfortably; a
 long free-text field is cramped. The design accounts for this with a single-column layout
 that degrades gracefully, and an "Open in Editor" action that reopens the same form as a
-full-width editor panel (§8.8). With only five short fields the sidebar is in practice
+full-width editor panel (§8.10). With only five short fields the sidebar is in practice
 adequate, so this is an escape hatch rather than a load-bearing part of the design.
 
 ## 4. Architecture
@@ -142,8 +146,8 @@ adequate, so this is an escape hatch rather than a load-bearing part of the desi
 │  GET  /api/v1/events                      server-stream of alerts (NDJSON)     │
 │  GET  /api/v1/alerts:pending              catch-up / long-poll fallback        │
 │  POST /api/v1/alerts/{id}/response        user's button choice or dismissal    │
-│  GET  /api/v1/form-config                 GPU catalogue + current allocation   │
-│  POST /api/v1/resource-requests           form submission                      │
+│  GET  /api/v1/machine/config              catalogue + current config + limits  │
+│  POST /api/v1/machine/config:apply        apply a new configuration            │
 └───────────────────────────────────────────────────────────────────────────────┘
 
 Module boundaries matter for one practical reason: `ApiClient`, `EventStream`, `Outbox`
@@ -165,8 +169,8 @@ Six RPCs:
 | `SubscribeEvents` | `GET /api/v1/events` | Server stream of alerts, revocations, heartbeats |
 | `ListPendingAlerts` | `GET /api/v1/alerts:pending` | Catch-up on activation; long-poll fallback |
 | `RespondToAlert` | `POST /api/v1/alerts/{alert_id}/response` | Record the user's answer |
-| `GetFormConfig` | `GET /api/v1/form-config` | GPU catalogue + current allocation + bounds |
-| `SubmitResourceRequest` | `POST /api/v1/resource-requests` | Submit the form |
+| `GetMachineConfig` | `GET /api/v1/machine/config` | GPU catalogue + current config + bounds + any change in flight |
+| `ApplyMachineConfig` | `POST /api/v1/machine/config:apply` | Apply a new configuration directly |
 
 ### 5.1 The streaming response is NDJSON, not SSE
 
@@ -233,7 +237,7 @@ Standard gRPC statuses, mapped by the gateway. The codes the client acts on:
 
 | gRPC code | HTTP | Client behaviour |
 |---|---|---|
-| `INVALID_ARGUMENT` | 400 | Field-level errors mapped back onto inputs (§8.7); never retried |
+| `INVALID_ARGUMENT` | 400 | Field-level errors mapped back onto inputs (§8.8); never retried |
 | `UNAUTHENTICATED` | 401 | Re-resolve the token once, then prompt; stop reconnecting (§6.3) |
 | `PERMISSION_DENIED` | 403 | Token is not authorized for this client id; prompt, do not retry |
 | `NOT_FOUND` | 404 | Unknown alert or client id; drop from the view and log |
@@ -428,11 +432,16 @@ programmatically (§7.2), so the stale notification remains — clicking it post
 that the server rejects with `FAILED_PRECONDITION`, and the client shows "This alert is no
 longer active" rather than an error. The view, not the notification, is the honest record.
 
-## 8. The form
+## 8. The machine configuration form
+
+The form edits a live machine and the backend applies changes directly, with no approval
+step in between. That single fact drives most of what follows: a mis-click here
+reconfigures somebody's machine, so the design spends more effort on confirming intent and
+on not clobbering concurrent changes than it does on rendering five inputs.
 
 ### 8.1 Primary surface: a WebviewView in the sidebar
 
-Registered with `vscode.window.registerWebviewViewProvider('acmeAlerts.form', provider,
+Registered with `vscode.window.registerWebviewViewProvider('acmeAlerts.machine', provider,
 { webviewOptions: { retainContextWhenHidden: false } })`.
 
 The important behavioural difference from a webview panel: **a `WebviewView` is torn down
@@ -452,10 +461,11 @@ mechanism, not two.
 - CSP: `default-src 'none'; style-src ${webview.cspSource}; script-src 'nonce-${nonce}';`
   with `localResourceRoots` limited to `media/`.
 - Message protocol:
-  - webview → extension: `{ type: 'submit', payload }`, `{ type: 'draft', payload }`,
-    `{ type: 'refreshOptions' }`
-  - extension → webview: `{ type: 'init', draft, options, optionsState }`,
-    `{ type: 'busy', value }`, `{ type: 'result', ok, error?, fieldErrors? }`
+  - webview → extension: `{ type: 'apply', spec }`, `{ type: 'draft', spec }`,
+    `{ type: 'discard' }`, `{ type: 'refresh' }`
+  - extension → webview: `{ type: 'init', config, draft, state }`,
+    `{ type: 'busy', value }`, `{ type: 'result', ok, error?, fieldErrors? }`,
+    `{ type: 'configChanged', config }`
 
 ### 8.2 The fields
 
@@ -466,7 +476,7 @@ than a rewrite.
 
 | Field | Control | Range | Notes |
 |---|---|---|---|
-| GPU Type | `<select>` | options from `GetFormConfig` | Options are dynamic; the field itself is not |
+| GPU Type | `<select>` | options from `GetMachineConfig` | Options are dynamic; the field itself is not |
 | Number of GPUs | `<select>` 1…N | 1–`maxCount` (≤8) | Hidden when GPU Type is `none` |
 | CPU cores | text, `inputmode="numeric"` | 1–256 | |
 | RAM (GB) | text, `inputmode="numeric"` | 1–2048 | |
@@ -501,27 +511,27 @@ Rules, in the order they matter:
 The extension re-derives all of this before POSTing. The webview decides what to *show*;
 it never decides what to *send*.
 
-### 8.4 Form config: options, defaults, and failure
+### 8.4 Loading the config: catalogue, current values, and failure
 
-`GetFormConfig` returns three things in one call — the GPU catalogue, the client's
-**current allocation**, and the numeric bounds. One call rather than three, so the form
-cannot render half-configured.
+`GetMachineConfig` returns everything the form needs in one call — the GPU catalogue, the
+machine's **current configuration**, the numeric bounds, and any change already in flight.
+One call rather than four, so the form cannot render half-configured.
 
-**Defaults are the current allocation.** This changes what the form *is*: not a blank
-request, but the machine's present configuration presented for editing. That shapes the UI:
+**The form is the machine's current state, presented for editing.** That shapes the UI:
 
 - Fields are pre-filled from `current`. A user who wants one more GPU changes one dropdown
   instead of retyping five values they must first go and look up.
-- **Submit is disabled until something differs** from `current`, with the button reading
-  "No changes" in that state. Submitting a request identical to the running configuration
-  is never what anyone meant.
-- Changed fields carry a subtle modified marker, and the view title bar gets a **"Reset to
-  current"** action. The user can always see what they are about to change.
-- A client with **no current allocation** (`current` absent) gets an empty form and a
-  Submit enabled as soon as it validates — the first-request path still works.
+- **Apply is disabled until something differs** from `current`, with the button reading
+  "No changes" in that state. Applying a configuration identical to the running one is
+  never what anyone meant, and here it would cost a reboot for nothing.
+- Changed fields carry a modified marker, and the view title bar gets a **"Discard
+  changes"** action. The user can always see exactly what they are about to change.
+- A machine with **no current configuration** (`current` absent) gets an empty form, with
+  Apply enabled as soon as it validates.
 - If `current.gpu_type_id` is no longer in the catalogue, the field renders empty with
   "Your current GPU type is no longer offered", rather than silently pre-selecting
-  something else.
+  something else. Note that in this state *any* apply necessarily changes the GPU, so the
+  confirmation dialog (§8.7) says so explicitly.
 
 **Bounds come from `limits` when present**, falling back to the documented 1–256 cores,
 1–2048 GB RAM, 1–2048 GB SSD, 1–8 GPUs. Three lines of fallback buys the ability to change
@@ -533,15 +543,17 @@ Caching and failure:
   **immediately** and revalidates in the background; a changed `version` swaps the config
   in place, preserving the user's edits where the fields still exist.
 - **Refreshed** on activation, on the view becoming visible when the cache is older than
-  15 minutes, on an explicit refresh button, and after any `INVALID_ARGUMENT` naming
-  `spec.gpu_type_id`.
+  15 minutes, on an explicit refresh button, on every `MachineConfigChanged` event, and
+  after any `ABORTED` or `INVALID_ARGUMENT` naming `spec.gpu_type_id`.
 - **Cold start with no cache and a failed fetch** → explicit error state ("Couldn't load
   configuration") with Retry, Submit disabled. Not an empty dropdown, and not a form
   someone fills in before discovering it cannot be sent.
 - **Stale cache with a failed refresh** → the form stays usable with a quiet notice that
   it may be out of date. Degraded beats blocked; the server validates on submit anyway.
-  Note the defaults may also be stale in this state, which is a stronger argument than
-  before for showing the notice rather than hiding it.
+  Note the *current values* may also be stale in this state, so the notice is not
+  cosmetic: it is the difference between the user thinking they are editing their machine
+  and knowing they might not be. Apply stays enabled — `expected_version` makes a stale
+  apply fail safely (§8.9) rather than silently doing the wrong thing.
 
 ### 8.5 Draft persistence
 
@@ -576,24 +588,84 @@ apply per field, with messages naming the bound ("RAM must be between 1 and 2048
 Validation fires on blur and on submit, not on every keystroke — flagging `1` as invalid
 while someone is still typing `128` trains users to ignore the error text.
 
-### 8.7 Submit
+### 8.7 Confirming intent
 
-Disable the form → validate in the extension → POST with an `Idempotency-Key` generated
-once per submission attempt → on success clear the draft, reset the form to defaults, show
-a confirmation notification with an "Open" button linking to the created record.
+Apply reconfigures a live machine with no approval step behind it, so the button is not
+the point of no return — the confirmation is.
 
-On `INVALID_ARGUMENT` (400), map the `google.rpc.BadRequest` field violations back onto
-the specific inputs by their proto paths (`spec.ram_gb` → the RAM field) so the user sees
-the problem next to the field rather than in a generic banner. There are no client-side
+On Apply, before any request goes out, a **modal dialog** shows the diff and nothing else:
+
+```
+Apply these changes to your machine?
+
+  GPU        NVIDIA A100 40GB x2  ->  NVIDIA H100 80GB x4
+  CPU cores  32                   ->  64
+  RAM        256 GB               ->  512 GB
+  SSD        1024 GB                  (unchanged)
+
+This will restart your machine. Running jobs will be terminated.
+
+                            [ Apply changes ]  [ Cancel ]
+```
+
+Details that matter:
+
+- **Only changed rows are emphasised**; unchanged ones are shown greyed for context rather
+  than hidden, so the user can confirm the whole resulting state at a glance.
+- **The warning line comes from the server** (`requires_restart`, `change_warning`). The
+  extension cannot know whether reconfiguring costs a reboot, and guessing either
+  frightens people needlessly or fails to warn them.
+- **The dialog is not suppressible.** No "don't ask again" checkbox. The action is
+  destructive, infrequent, and costs one extra click — a bad trade to optimise away.
+- Cancel returns to the form with the edits intact. Cancelling is not discarding.
+
+### 8.8 Applying, and what happens next
+
+`ApplyMachineConfig` returns as soon as the change is *accepted*, not when it is finished —
+reprovisioning takes as long as it takes. So:
+
+1. Validate in the extension → POST with `idempotency_key` and `expected_version`.
+2. The response carries a `MachineChange` with status `APPLYING`. The form goes
+   **read-only** with an "Applying changes…" state and a progress indicator; the view
+   shows the same, so it is visible without opening the form.
+3. Completion arrives as a **`MachineConfigChanged` event on the stream**, not by polling.
+   The form refreshes its current values from the event, returns to editable, and a
+   notification reports success (with an "Open" button when `url` is set) or failure (with
+   `failure_reason` shown verbatim).
+4. If the stream is down, the fallback is a `GetMachineConfig` poll every 15s while a
+   change is pending, stopping when `pending_change` clears.
+
+Because `pending_change` is part of `GetMachineConfig`, a user who closes VS Code mid-apply
+and reopens it lands back in the "Applying changes…" state rather than seeing a stale
+editable form.
+
+On `INVALID_ARGUMENT` (400), map the `google.rpc.BadRequest` field violations back onto the
+specific inputs by their proto paths (`spec.ram_gb` → the RAM field) so the user sees the
+problem next to the field rather than in a generic banner. There are no client-side
 cross-field rules today, so any such limit the backend adds later arrives through exactly
-this path and needs no client change. On network failure, re-enable the form and offer to queue the submission in the
-outbox (§9.1).
+this path and needs no client change.
 
-On success the sidebar view **resets in place** rather than closing, since there is
-nothing to close — the user is left looking at an empty ready form, which is the right
-resting state for something people submit repeatedly.
+**A failed apply does not go in the outbox** — see §9.1, the one place where durable retry
+is the wrong answer.
 
-### 8.8 "Open in Editor"
+### 8.9 Concurrent changes
+
+The form can sit open for an hour. In that time the machine may be reconfigured from
+another window, another device, or by an administrator. Applying a form built from stale
+data would silently revert that change.
+
+`expected_version` prevents it: the client echoes back the `version` its form was rendered
+from, and the server rejects a mismatch with `ABORTED` (409). The client refetches, shows
+**what changed underneath** — "Your machine was changed elsewhere: RAM 256 → 512 GB" — and
+leaves the user's edits in place so they can decide whether they still want them.
+Re-applying is a deliberate second action, never automatic.
+
+`MachineConfigChanged` events make this rare in practice: a change from another window
+updates this one's form live, and an unedited form simply follows along. The precondition
+catches the case where the event never arrived — which is exactly the case where guessing
+would be worst.
+
+### 8.10 "Open in Editor"
 
 A button in the view title bar reopens the same form as a full-width `WebviewPanel` in the
 editor area. The two hosts share one HTML generator, one message handler and one draft —
@@ -605,8 +677,8 @@ hatch if field count grows.
 
 ### 9.1 Outbox
 
-Alert responses and form submissions are user intent that must not evaporate because the
-network blipped. Both go through a durable queue in `globalState`:
+**Alert responses** are user intent that must not evaporate because the network blipped,
+so they go through a durable queue in `globalState`:
 
 - Each entry: `{ id, kind, url, body, idempotencyKey, attempts, nextAttemptAt }`.
 - Flushed on: successful send of anything else, stream reconnect, extension activation, and a
@@ -614,6 +686,13 @@ network blipped. Both go through a durable queue in `globalState`:
 - Bounded at 100 entries and 7 days; older entries are dropped with a log line.
 - Because every entry carries an idempotency key, replaying after an ambiguous failure is
   safe.
+
+**Config applies deliberately do not use it.** Replaying a machine reconfiguration minutes
+later, once the network returns and the user has moved on, is what nobody wants: they may
+have changed their mind, closed the laptop, or had somebody else adjust the machine
+meanwhile. A failed apply fails visibly, the edits stay in the form, and retrying is a
+fresh deliberate action with a fresh confirmation. Durability is right for recording an
+answer and wrong for triggering a reboot.
 
 ### 9.2 Duplicate delivery
 
@@ -659,8 +738,9 @@ Each phase is independently demoable. Phases 3–5 assume the mock server from P
 | 3 | Contract + client + mock | `buf generate` wired up (Go stubs, gateway, OpenAPI, TS types); `ApiClient` over the generated types; a small **Go** mock implementing the service behind the real gateway, with a CLI to push and revoke alerts | `buf lint` and `buf breaking` pass in CI; `GetClientInfo` succeeds against the mock; every gRPC code maps to the documented client behaviour |
 | 4 | Alerts via polling | `AlertService`: catch-up poll, notification with 1–2 buttons, response POST, dedupe set; `AlertTreeProvider` with inline action buttons, badge and welcome states | Push an alert from the mock CLI → it appears in both the notification and the view, badge increments, answering either way records once |
 | 5 | Event stream | `EventStream`: NDJSON reader + `result` unwrap, heartbeat timeout, jittered backoff, `last_sequence` resume, long-poll fallback | Kill the mock mid-stream → client reconnects and receives alerts queued during the outage with no gap and no duplicate |
-| 6 | Form | `WebviewView` in the sidebar, the five fields, options fetch + cache + error states, conditional GPU count, strict validation, submit, "Open in Editor" | Open from the Activity Bar → fill → submit → mock records the payload; `none` omits `gpuCount`; toggling to `none` and back restores the count; `1e3` and `12abc` are rejected; cold start with the mock down shows Retry, not an empty dropdown; collapsing the view preserves the draft |
-| 7 | Reliability | Outbox, draft persistence, alert-burst coalescing, 409 handling | Submit with the mock stopped → restart mock → submission arrives exactly once; 10 alerts at once produce one notification and 10 view entries |
+| 6 | Machine form | `WebviewView` in the sidebar, the five fields, config fetch + cache + error states, pre-fill from current, conditional GPU count, strict validation, "Open in Editor" | Open from the Activity Bar → current config is pre-filled → Apply is disabled until something differs; `none` omits `gpuCount`; toggling to `none` and back restores the count; `1e3` and `12abc` are rejected; cold start with the mock down shows Retry, not an empty dropdown; collapsing the view preserves the draft |
+| 6b | Applying | Confirmation diff dialog, `APPLYING` read-only state, completion via `MachineConfigChanged`, poll fallback, `expected_version` conflict handling | Apply → dialog lists exactly the changed fields and the server's restart warning → Cancel keeps edits → confirm → form locks → mock completes → form unlocks with new current values; a change applied from a second window updates the first live; applying against a stale version shows what changed instead of clobbering it |
+| 7 | Reliability | Outbox for alert responses, alert persistence + revocation, draft persistence, burst coalescing | Answer an alert with the mock stopped → restart → the answer arrives exactly once; an apply that fails offline is **not** replayed later; alerts survive a window reload without re-notifying; revoking an alert removes it from the view; 10 alerts at once produce one notification and 10 view entries |
 | 8 | Tests | Unit (parser, backoff, token resolution, outbox, validation) + `@vscode/test-electron` integration (commands registered, view container resolves, webview view renders) + manual matrix incl. a narrow sidebar and high-contrast theme | CI green on Linux/macOS/Windows |
 | 9 | Packaging & version skew | `vsce package`, README with install instructions, CHANGELOG, icon; `min_client_version` check with an actionable "update your .vsix" prompt | A `.vsix` installs cleanly on a machine that never had the dev setup; a deliberately old build shows the update prompt instead of failing obscurely |
 | 10 | Ops | Structured logs and a "Report Issue" command that dumps redacted diagnostics to the clipboard. **No telemetry** — the extension reports nothing beyond the six RPCs | Support can diagnose a user issue from one pasted log |
@@ -674,7 +754,7 @@ conditions.
 | Risk | Impact | Mitigation |
 |---|---|---|
 | Activity Bar slot is intrusive for low-frequency users | Users hide the container and stop seeing alerts | Notifications remain the primary alert channel and work with the container hidden (§3.5) |
-| Sidebar too narrow for comfortable typing | Users avoid the form | Five short fields fit; fluid single-column layout plus "Open in Editor" (§8.8) |
+| Sidebar too narrow for comfortable typing | Users avoid the form | Five short fields fit; fluid single-column layout plus "Open in Editor" (§8.10) |
 | `WebviewView` torn down when hidden | Lost input, reported as a data-loss bug | Draft persistence on every change, tested explicitly in Phase 6 (§8.5) |
 | Corporate proxy buffers the chunked stream | Alerts arrive minutes late or never | Per-message `Flush()`, `X-Accel-Buffering: no`, no compression; long-poll fallback; test behind the real proxy in Phase 5 |
 | Token in `settings.json` leaks via Settings Sync or a commit | Credential exposure | Application-scoped setting, SecretStorage migration, redacting logger (§6.2) |
@@ -683,7 +763,10 @@ conditions.
 | Hardcoded fields change | New release + user updates for every field tweak | Single `fields.ts` declaration keeps the later schema migration contained (§8.2) |
 | GPU list unreachable on a cold start | Form is unusable, not merely degraded | Cached list + explicit error state with Retry instead of an empty dropdown (§8.4) |
 | Lenient numeric parsing | Silently provisioning the wrong resources | Strict integer parser, no `parseInt`; server validates independently (§8.6) |
-| GPU type retired between render and submit | Request provisioned against a dead type | `form_config_version` on submit, violation on `spec.gpu_type_id` → refresh + clear selection, never substitute (§8.4) |
+| GPU type retired between render and apply | Machine reconfigured onto a dead type | `expected_version` on apply, violation on `spec.gpu_type_id` → refresh + clear selection, never substitute (§8.4) |
+| Accidental apply reconfigures a live machine | Lost running jobs, unplanned reboot | Non-suppressible confirmation dialog showing the diff and the server's restart warning (§8.7) |
+| Stale form reverts somebody else's change | Silent regression nobody notices | `expected_version` precondition → `ABORTED`, show what changed, never auto-reapply (§8.9) |
+| Offline apply replayed later from a queue | Machine reboots long after the user moved on | Applies are excluded from the outbox by design (§9.1) |
 | Remote dev has no route to the server | Extension silently dead | `extensionKind` + one remote test (§9.4) |
 | `.vsix` never auto-updates | Old clients stay in the field indefinitely | `min_client_version` from `GetClientInfo` + `buf breaking` in CI; additive proto changes only (Phase 9) |
 | Client-id file missing or unprovisioned | Extension appears to do nothing at all | Explicit `viewsWelcome` naming the searched path; never self-generate an id (§6.0) |
@@ -691,32 +774,42 @@ conditions.
 
 ## 12. Settled, and what remains
 
-All of §12's earlier questions are answered and folded into the design above:
+Every question this document opened with is answered and folded into the design above:
 
 | Question | Answer | Where it landed |
 |---|---|---|
 | Form fields | GPU type + count, CPU, RAM, SSD | §5 proto, §8.2 |
 | RAM/SSD granularity | Any integer in range | §8.2 |
-| Defaults | The client's current configuration, from the backend | §8.4 |
-| Cross-field limits | None for now, may change | §8.7 — arrives as field violations, no client change needed |
+| Defaults | The machine's current configuration, from the backend | §8.4 |
+| Cross-field limits | None for now, may change | §8.8 — arrives as field violations, no client change needed |
 | Alert lifetime | Persist until answered; server may revoke | §7.4, `AlertRevoked` |
 | Routing | Client-id file on the machine | §6.0 |
 | Distribution | `.vsix` passed around | Phase 9, `min_client_version` |
-| Multiple submissions | One at a time | §8.1 single view |
+| Multiple submissions | One at a time | §8.1, enforced by `pending_change` |
 | Telemetry | None | Phase 10 |
+| What the form is | **Change my machine**, applied directly | §8 throughout |
 
 Two assumptions remain, both cheap for the backend to overturn:
 
-1. **`max_count` is per GPU type**, defaulting to 8 when omitted (§5 proto). If the limit
-   really is a flat 1–8 across every accelerator, drop the field and nothing else changes.
+1. **`max_count` is per GPU type**, defaulting to 8 when omitted. If the limit really is a
+   flat 1–8 across every accelerator, drop the field and nothing else changes.
 2. **The `none` option is server-supplied** with the reserved id `none`, so the backend
    words its label. The client synthesises it if absent, but logs a warning.
 
-And one genuine question, which only matters for wording:
+And three questions the "applied directly" answer newly raises. None blocks Phase 1; the
+first two want answering before Phase 6b:
 
-3. **What is this form called to the user?** Now that it opens pre-filled with the current
-   allocation, it reads as "change my machine" rather than "request a machine". The view
-   is currently titled "New Request" and the button says "Submit". If the backend applies
-   changes directly, "Configuration" and "Apply changes" would describe it more honestly;
-   if a human approves each one, the request framing is right. `RequestStatus` in the
-   proto supports either.
+3. **Does applying always restart the machine, or only for some changes?** The proto
+   carries `requires_restart` as a property of the config response, which assumes it is a
+   property of the machine. If it depends on *which* field changed — growing a disk being
+   cheap while swapping a GPU is not — then it belongs on a per-change preview instead,
+   and the confirmation dialog should say which of the user's specific edits force the
+   reboot.
+4. **Can an apply be cancelled once it is under way?** Right now the form simply locks
+   until the machine reports back. If the backend can abort a change in progress, that is
+   a `CancelMachineChange` RPC and a Cancel button in the applying state.
+5. **What happens to a machine mid-apply if the change fails?** Does it stay on the old
+   configuration, or can it land somewhere in between? The client currently shows
+   `failure_reason` and refreshes from the server, which is right either way — but if a
+   partial state is possible, the user should be told that explicitly rather than left to
+   infer it.
