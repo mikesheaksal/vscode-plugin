@@ -1,0 +1,477 @@
+syntax = "proto3";
+
+// Contract between the VS Code extension and the Go backend.
+//
+// The backend serves gRPC; grpc-gateway projects the same service onto the
+// JSON/HTTP paths in the google.api.http annotations below, and that projection
+// is what the extension talks to. See docs/DESIGN.md §5 for the gateway
+// specifics the client depends on (streaming envelope, JSON field naming,
+// status-code mapping).
+package acme.alerts.v1;
+
+import "google/api/annotations.proto";
+import "google/protobuf/timestamp.proto";
+
+option go_package = "github.com/mikesheaksal/vscode-plugin/gen/go/acme/alerts/v1;alertsv1";
+
+// ---------------------------------------------------------------------------
+// Service
+// ---------------------------------------------------------------------------
+
+service AlertService {
+  // Validates the token, confirms the client_id is known, and reports the
+  // minimum client version the server will accept. Called once on activation.
+  rpc GetClientInfo(GetClientInfoRequest) returns (GetClientInfoResponse) {
+    option (google.api.http) = {get: "/api/v1/client"};
+  }
+
+  // Long-lived server stream of alerts and lifecycle events.
+  //
+  // Over grpc-gateway this is a chunked HTTP response carrying one JSON object
+  // per line, each wrapped as {"result": <Event>}. It is NOT Server-Sent
+  // Events: there is no "data:" framing and no EventSource-compatible
+  // reconnect. Resumption is by last_sequence, not the Last-Event-ID header.
+  rpc SubscribeEvents(SubscribeEventsRequest) returns (stream Event) {
+    option (google.api.http) = {get: "/api/v1/events"};
+  }
+
+  // Fallback for environments where the streaming response is buffered by a
+  // proxy, and the catch-up call made on activation before subscribing.
+  // Blocks up to wait_seconds for an alert to arrive; returns immediately if
+  // any are already pending.
+  rpc ListPendingAlerts(ListPendingAlertsRequest) returns (ListPendingAlertsResponse) {
+    option (google.api.http) = {get: "/api/v1/alerts:pending"};
+  }
+
+  // Records the user's answer. Idempotent on idempotency_key.
+  rpc RespondToAlert(RespondToAlertRequest) returns (RespondToAlertResponse) {
+    option (google.api.http) = {
+      post: "/api/v1/alerts/{alert_id}/response"
+      body: "*"
+    };
+  }
+
+  // Everything the form needs to render: the GPU catalogue, the machine's
+  // current configuration, the numeric bounds, and any change already in
+  // flight. One call, so the form cannot render half-configured.
+  rpc GetMachineConfig(GetMachineConfigRequest) returns (GetMachineConfigResponse) {
+    option (google.api.http) = {get: "/api/v1/machine/config"};
+  }
+
+  // Computes what applying a spec would do, without doing it: whether it needs
+  // a restart, which specific edits force that, and any validation errors.
+  //
+  // Called immediately before the confirmation dialog, so the dialog states
+  // real consequences rather than guesses. Restarts are NOT required by every
+  // change, and only the server knows which ones need one. This doubles as
+  // pre-flight validation: the user should never confirm a change that is then
+  // rejected.
+  rpc PreviewMachineConfig(PreviewMachineConfigRequest) returns (PreviewMachineConfigResponse) {
+    option (google.api.http) = {
+      post: "/api/v1/machine/config:preview"
+      body: "*"
+    };
+  }
+
+  // Aborts a change that is still within its cancellation window
+  // (MachineChange.cancellable_until). Past that point the server returns
+  // FAILED_PRECONDITION and the change runs to completion.
+  rpc CancelMachineChange(CancelMachineChangeRequest) returns (CancelMachineChangeResponse) {
+    option (google.api.http) = {
+      post: "/api/v1/machine/changes/{change_id}:cancel"
+      body: "*"
+    };
+  }
+
+  // Applies a new configuration to the machine directly — there is no approval
+  // step. Idempotent on idempotency_key, and guarded by expected_version so a
+  // form rendered from stale data cannot silently clobber a concurrent change.
+  //
+  // Returns as soon as the change is accepted; completion arrives as a
+  // MachineConfigChanged event on the stream.
+  rpc ApplyMachineConfig(ApplyMachineConfigRequest) returns (ApplyMachineConfigResponse) {
+    option (google.api.http) = {
+      post: "/api/v1/machine/config:apply"
+      body: "*"
+    };
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Identity
+// ---------------------------------------------------------------------------
+
+message GetClientInfoRequest {
+  // Opaque routing identifier read from the client-id file on the user's
+  // machine (docs/DESIGN.md §6). Not a credential: the bearer token is. The
+  // server MUST verify that the presented token is authorized for this
+  // client_id, or any token holder could receive another client's alerts.
+  string client_id = 1;
+}
+
+message GetClientInfoResponse {
+  string client_id = 1;
+  string display_name = 2;
+
+  // Semver. The extension is distributed as a .vsix passed around by hand, so
+  // it never auto-updates; this is how an out-of-date install is told to
+  // update rather than failing in confusing ways.
+  string min_client_version = 3;
+
+  google.protobuf.Timestamp server_time = 4;
+}
+
+// ---------------------------------------------------------------------------
+// Event stream
+// ---------------------------------------------------------------------------
+
+message SubscribeEventsRequest {
+  string client_id = 1;
+
+  // Highest Event.sequence the client has already processed. The server
+  // replays everything after it. Zero (or absent) means "send me everything
+  // currently outstanding".
+  uint64 last_sequence = 2;
+
+  // Reported so the server can log version skew against a fleet it cannot
+  // update. Advisory only.
+  string client_version = 3;
+}
+
+message Event {
+  // Monotonically increasing per client_id, gapless. The client persists the
+  // highest value it has handled and sends it back as last_sequence on
+  // reconnect.
+  uint64 sequence = 1;
+
+  oneof payload {
+    Alert alert = 2;
+    AlertRevoked alert_revoked = 3;
+
+    // Sent every 25s so the client can distinguish a quiet server from a
+    // half-open connection. Carries no meaning beyond its arrival.
+    Heartbeat heartbeat = 4;
+
+    // A configuration change finished applying, failed, or was made by
+    // somebody else. The form refreshes its current values from this rather
+    // than polling.
+    MachineConfigChanged machine_config_changed = 5;
+  }
+}
+
+message Heartbeat {
+  google.protobuf.Timestamp server_time = 1;
+}
+
+message Alert {
+  string alert_id = 1;
+  Severity severity = 2;
+  string title = 3;
+  string message = 4;
+
+  // Blocks the editor until answered. Expensive to the user's attention;
+  // reserve for alerts that genuinely cannot wait.
+  bool modal = 5;
+
+  // Zero to two. The client truncates anything longer rather than failing,
+  // and synthesises an "OK" button if empty — a VS Code notification without
+  // buttons auto-hides and would be missed.
+  repeated AlertButton buttons = 6;
+
+  google.protobuf.Timestamp created_at = 7;
+}
+
+message AlertButton {
+  string button_id = 1;
+  string label = 2;
+  bool is_primary = 3;
+}
+
+// Alerts have no client-side expiry: an unanswered alert persists across
+// restarts until the user answers it or the server withdraws it with this.
+message AlertRevoked {
+  string alert_id = 1;
+
+  // Shown to the user if the alert was on screen. Optional.
+  string reason = 2;
+}
+
+enum Severity {
+  SEVERITY_UNSPECIFIED = 0;
+  SEVERITY_INFO = 1;
+  SEVERITY_WARNING = 2;
+  SEVERITY_ERROR = 3;
+}
+
+// ---------------------------------------------------------------------------
+// Alert responses
+// ---------------------------------------------------------------------------
+
+message ListPendingAlertsRequest {
+  string client_id = 1;
+
+  // 0 returns immediately. Capped server-side; 30 is the client's default.
+  uint32 wait_seconds = 2;
+}
+
+message ListPendingAlertsResponse {
+  repeated Alert alerts = 1;
+
+  // Highest sequence represented by this response, so a client that fell back
+  // to polling can resume streaming without a gap.
+  uint64 sequence = 2;
+}
+
+message RespondToAlertRequest {
+  string alert_id = 1;
+  string client_id = 2;
+  AlertOutcome outcome = 3;
+
+  // Set only when outcome is ANSWERED; must match one of the alert's buttons.
+  string button_id = 4;
+
+  google.protobuf.Timestamp responded_at = 5;
+
+  // Generated once per user action and reused across retries. Replaying the
+  // same key returns the original result; a different answer to an already
+  // answered alert is ABORTED (409).
+  string idempotency_key = 6;
+}
+
+message RespondToAlertResponse {
+  string alert_id = 1;
+
+  // True when this call recorded the answer, false when it matched an answer
+  // already on file. Lets the client tell a successful retry from a genuine
+  // double-submit without treating either as an error.
+  bool recorded = 2;
+}
+
+enum AlertOutcome {
+  ALERT_OUTCOME_UNSPECIFIED = 0;
+  ALERT_OUTCOME_ANSWERED = 1;
+
+  // The user closed the notification without choosing a button. Reported so
+  // the server can distinguish "seen and ignored" from "never delivered"; the
+  // alert stays outstanding.
+  ALERT_OUTCOME_DISMISSED = 2;
+}
+
+// ---------------------------------------------------------------------------
+// Machine configuration
+// ---------------------------------------------------------------------------
+
+message GetMachineConfigRequest {
+  string client_id = 1;
+}
+
+message GetMachineConfigResponse {
+  // Opaque version of the machine's configuration state. Echoed back as
+  // ApplyMachineConfigRequest.expected_version; the server rejects a mismatch.
+  // This is what stops a form left open for an hour from reverting a change
+  // somebody made in the meantime.
+  string version = 1;
+
+  // Rendered in the order given; the client does not re-sort. Must include the
+  // reserved "none" id. The client synthesises it when absent, and logs a
+  // warning: a form with no way to say "no GPU" is broken.
+  repeated GpuType gpu_types = 2;
+
+  // The machine's current configuration. This is what the form is pre-filled
+  // with and what "changed" is measured against. Absent only for a machine
+  // that has never been configured.
+  optional ResourceSpec current = 3;
+
+  // Absent means the documented defaults apply: 1-256 cores, 1-2048 GB RAM,
+  // 1-2048 GB SSD, 1-8 GPUs. Sending them explicitly means a bound can change
+  // without shipping a new .vsix.
+  optional ResourceLimits limits = 4;
+
+  // Set while a change is applying. The client renders the form read-only
+  // rather than letting the user queue a second change on top of the first.
+  optional MachineChange pending_change = 5;
+
+  // 6, 7 were a machine-wide requires_restart/change_warning pair. Whether a
+  // restart is needed depends on which fields change, not on the machine, so
+  // it moved to PreviewMachineConfigResponse.
+  reserved 6, 7;
+}
+
+message GpuType {
+  // "none" is reserved and means no GPU.
+  string gpu_type_id = 1;
+
+  string label = 2;
+
+  // Upper bound on gpu_count for this type. Node topologies differ per
+  // accelerator, so this is per-type rather than a single global maximum. The
+  // client clamps to min(max_count, limits.gpu_count_max).
+  uint32 max_count = 3;
+}
+
+message ResourceSpec {
+  string gpu_type_id = 1;
+
+  // Absent when gpu_type_id is "none" — not zero. A request that sets both is
+  // rejected with INVALID_ARGUMENT rather than silently ignoring the field, so
+  // a bug in the client's conditional logic surfaces immediately instead of
+  // quietly provisioning the wrong thing.
+  optional uint32 gpu_count = 2;
+
+  uint32 cpu_cores = 3;
+  uint32 ram_gb = 4;
+  uint32 ssd_gb = 5;
+}
+
+message ResourceLimits {
+  uint32 gpu_count_min = 1;
+  uint32 gpu_count_max = 2;
+  uint32 cpu_cores_min = 3;
+  uint32 cpu_cores_max = 4;
+  uint32 ram_gb_min = 5;
+  uint32 ram_gb_max = 6;
+  uint32 ssd_gb_min = 7;
+  uint32 ssd_gb_max = 8;
+}
+
+message PreviewMachineConfigRequest {
+  string client_id = 1;
+
+  // The complete desired configuration, exactly as it would be sent to
+  // ApplyMachineConfig.
+  ResourceSpec spec = 2;
+
+  string expected_version = 3;
+}
+
+message PreviewMachineConfigResponse {
+  // False when the spec is identical to the current configuration. The client
+  // disables Apply in that state anyway, so this is a backstop.
+  bool has_changes = 1;
+
+  // True when applying this particular spec restarts the machine. Not a
+  // property of the machine: growing a disk may be free where swapping an
+  // accelerator is not.
+  bool requires_restart = 2;
+
+  // One per field the user changed, so the confirmation dialog can name which
+  // specific edit forces the restart rather than warning about the change as
+  // an undifferentiated whole.
+  repeated ChangeEffect effects = 3;
+
+  // Optional extra sentence for the dialog, e.g. "Running jobs will be
+  // terminated."
+  string warning = 4;
+
+  // How long the change will be cancellable once started, so the dialog can
+  // set expectations before the user commits. Zero means not cancellable.
+  uint32 cancellation_window_seconds = 5;
+}
+
+message ChangeEffect {
+  // Proto path of the changed field, e.g. "spec.ram_gb". Matches the paths
+  // used in google.rpc.BadRequest violations, so the client has one mapping
+  // from path to input.
+  string field_path = 1;
+
+  // Human-readable, shown beside the field's before/after in the dialog,
+  // e.g. "Requires a restart".
+  string description = 2;
+
+  bool requires_restart = 3;
+}
+
+message CancelMachineChangeRequest {
+  string change_id = 1;
+  string client_id = 2;
+}
+
+message CancelMachineChangeResponse {
+  MachineChange change = 1;
+}
+
+message ApplyMachineConfigRequest {
+  string client_id = 1;
+
+  // The complete desired configuration, not a delta. The server diffs it
+  // against what is current; sending the whole spec means an old client and a
+  // new server cannot disagree about which fields were "left alone".
+  ResourceSpec spec = 2;
+
+  // Generated once per apply attempt and reused across retries, so a response
+  // lost to a dropped connection can be replayed safely.
+  string idempotency_key = 3;
+
+  // GetMachineConfigResponse.version the form was rendered from. A mismatch is
+  // ABORTED (409) and the client refetches and shows what changed, rather than
+  // overwriting it.
+  string expected_version = 4;
+
+  string client_version = 5;
+}
+
+message ApplyMachineConfigResponse {
+  MachineChange change = 1;
+
+  // Anchor for rendering the cancellation countdown without depending on how
+  // recently a heartbeat arrived.
+  google.protobuf.Timestamp server_time = 2;
+}
+
+message MachineChange {
+  string change_id = 1;
+  ChangeStatus status = 2;
+
+  // The configuration being applied.
+  ResourceSpec spec = 3;
+
+  google.protobuf.Timestamp started_at = 4;
+
+  // Deadline for CancelMachineChange. Absent when the change was never
+  // cancellable or the window has closed. The client renders a countdown from
+  // this, corrected for clock skew against the server time it tracks from
+  // heartbeats — and treats its own countdown as advisory, since the server
+  // is the authority on whether a cancel arrived in time.
+  optional google.protobuf.Timestamp cancellable_until = 7;
+
+  // Set when status is FAILED. Shown to the user verbatim, so it should read
+  // as an explanation rather than a stack trace.
+  //
+  // A failed or cancelled change leaves the machine on its previous
+  // configuration — the server reverts, and there is no partial state for the
+  // client to represent or the user to untangle.
+  string failure_reason = 5;
+
+  // Deep link to the change record, offered as an "Open" button on the
+  // completion notification. Optional.
+  string url = 6;
+}
+
+message MachineConfigChanged {
+  // The configuration now in effect.
+  ResourceSpec current = 1;
+
+  // New config version, to be used as expected_version on the next apply.
+  string version = 2;
+
+  // The change that produced this state. Absent when the change originated
+  // outside this client, which is exactly when the client most needs to know
+  // its form is stale.
+  optional MachineChange change = 3;
+}
+
+enum ChangeStatus {
+  CHANGE_STATUS_UNSPECIFIED = 0;
+  CHANGE_STATUS_APPLYING = 1;
+  CHANGE_STATUS_APPLIED = 2;
+
+  // Machine is back on its previous configuration.
+  CHANGE_STATUS_FAILED = 3;
+
+  // Cancel accepted, revert in progress.
+  CHANGE_STATUS_CANCELLING = 4;
+
+  // Cancelled and reverted. Terminal, and indistinguishable from FAILED in
+  // its effect on the machine — the distinction is whose decision it was.
+  CHANGE_STATUS_CANCELLED = 5;
+}
