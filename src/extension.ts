@@ -1,10 +1,9 @@
 import * as vscode from 'vscode';
+import { ConfigService } from './config';
 import { Logger } from './log';
 import { StateController } from './state';
 import { AlertsTreeProvider } from './views/alertsTree';
 import { MachineViewProvider } from './views/machineView';
-
-const CONFIG_SECTION = 'acmeAlerts';
 
 export function activate(context: vscode.ExtensionContext): void {
   const log = new Logger('Acme Alerts');
@@ -12,7 +11,8 @@ export function activate(context: vscode.ExtensionContext): void {
   log.info(`Activating ${context.extension.id} ${context.extension.packageJSON.version as string}`);
 
   const state = new StateController();
-  context.subscriptions.push(state);
+  const config = new ConfigService(context.secrets, log);
+  context.subscriptions.push(state, config);
 
   const alerts = new AlertsTreeProvider();
   context.subscriptions.push(alerts, alerts.register());
@@ -30,45 +30,39 @@ export function activate(context: vscode.ExtensionContext): void {
     vscode.commands.registerCommand('acmeAlerts.showMachine', () => machine.reveal()),
     vscode.commands.registerCommand('acmeAlerts.showLog', () => log.show()),
     vscode.commands.registerCommand('acmeAlerts.openSettings', () =>
-      vscode.commands.executeCommand('workbench.action.openSettings', `@ext:acme.acme-alerts`),
+      vscode.commands.executeCommand('workbench.action.openSettings', '@ext:acme.acme-alerts'),
     ),
-    vscode.commands.registerCommand('acmeAlerts.signIn', () => notImplemented('Sign in', log)),
-    vscode.commands.registerCommand('acmeAlerts.refresh', () => {
+    vscode.commands.registerCommand('acmeAlerts.signIn', () => config.signIn()),
+    vscode.commands.registerCommand('acmeAlerts.signOut', () => config.signOut()),
+    vscode.commands.registerCommand('acmeAlerts.refresh', async () => {
+      config.invalidate();
       alerts.refresh();
       machine.refresh();
+      await syncState(config, state, log);
     }),
   );
 
-  context.subscriptions.push(
-    vscode.workspace.onDidChangeConfiguration((event) => {
-      if (event.affectsConfiguration(CONFIG_SECTION)) {
-        log.debug('configuration changed');
-        void applyState(state, log);
-      }
-    }),
-  );
+  // ConfigService already watches settings, secret storage and the credential
+  // files, so this covers every way credentials can change.
+  context.subscriptions.push(config.onDidChange(() => void syncState(config, state, log)));
 
-  void applyState(state, log);
+  void syncState(config, state, log);
 }
 
 export function deactivate(): void {
   // Everything is registered through context.subscriptions.
 }
 
-/**
- * Phase 1 knows one thing about configuration: whether a server URL is set.
- * Token and client-id resolution — and the states that need a server round trip
- * to establish — arrive in Phase 2.
- */
-async function applyState(state: StateController, log: Logger): Promise<void> {
-  const serverUrl = vscode.workspace.getConfiguration(CONFIG_SECTION).get<string>('serverUrl', '');
-  const next = serverUrl.trim() === '' ? 'unconfigured' : 'ready';
-  await state.set(next);
-  await state.sync();
-  log.info(`State: ${next}`);
-}
-
-function notImplemented(what: string, log: Logger): void {
-  log.warn(`${what} is not implemented yet (Phase 2).`);
-  void vscode.window.showInformationMessage(`${what} arrives in Phase 2.`);
+async function syncState(
+  config: ConfigService,
+  state: StateController,
+  log: Logger,
+): Promise<void> {
+  const resolved = await config.resolve();
+  await state.set(resolved.kind);
+  if (resolved.kind === 'no-client-id') {
+    // Named explicitly because the fix is to create a file, and the user
+    // cannot do that without knowing where it is looked for.
+    log.warn(`No client id found at ${resolved.searchedPath}`);
+  }
 }

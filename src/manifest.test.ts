@@ -36,11 +36,11 @@ describe('manifest', () => {
   });
 
   it('points every welcome view at a state the extension can actually set', () => {
-    // StateController only produces these two. A `when` clause naming anything
-    // else renders an empty view with no explanation.
-    const known = new Set(['unconfigured', 'ready']);
+    // These are exactly CredentialState['kind']. A `when` clause naming
+    // anything else renders an empty view with no explanation.
+    const known = new Set(['no-server-url', 'no-client-id', 'signed-out', 'ready']);
     for (const welcome of manifest.contributes.viewsWelcome) {
-      const match = /acmeAlerts\.state == '(\w+)'/.exec(welcome.when);
+      const match = /acmeAlerts\.state == '([\w-]+)'/.exec(welcome.when);
       expect(match, `unparsed when clause: ${welcome.when}`).not.toBeNull();
       expect(known).toContain(match?.[1]);
     }

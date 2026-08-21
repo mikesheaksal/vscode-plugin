@@ -43,8 +43,18 @@
     "viewsWelcome": [
       {
         "view": "acmeAlerts.pending",
-        "contents": "Acme Alerts is not configured yet.\n\nSet the server URL, then provide a client id and a token.\n[Open Settings](command:acmeAlerts.openSettings)\n[Sign In](command:acmeAlerts.signIn)",
-        "when": "acmeAlerts.state == 'unconfigured'"
+        "contents": "Acme Alerts needs a server URL before it can connect.\n[Open Settings](command:acmeAlerts.openSettings)",
+        "when": "acmeAlerts.state == 'no-server-url'"
+      },
+      {
+        "view": "acmeAlerts.pending",
+        "contents": "No client id found on this machine.\n\nThis file identifies the machine to the server and is provisioned for you; the extension never creates one. Check the log for the path that was searched.\n[Show Log](command:acmeAlerts.showLog)\n[Retry](command:acmeAlerts.refresh)",
+        "when": "acmeAlerts.state == 'no-client-id'"
+      },
+      {
+        "view": "acmeAlerts.pending",
+        "contents": "Sign in to start receiving alerts.\n[Sign In](command:acmeAlerts.signIn)",
+        "when": "acmeAlerts.state == 'signed-out'"
       },
       {
         "view": "acmeAlerts.pending",
@@ -61,6 +71,11 @@
       {
         "command": "acmeAlerts.signIn",
         "title": "Sign In",
+        "category": "Acme Alerts"
+      },
+      {
+        "command": "acmeAlerts.signOut",
+        "title": "Sign Out",
         "category": "Acme Alerts"
       },
       {
