@@ -149,7 +149,8 @@
     "check": "npm run typecheck && npm run lint && npm run test && npm run build",
     "vscode:prepublish": "node esbuild.mjs --production",
     "pretest:integration": "npm run build && tsc -p tsconfig.test.json",
-    "test:integration": "vscode-test"
+    "test:integration": "vscode-test",
+    "package": "vsce package --no-dependencies"
   },
   "devDependencies": {
     "@types/mocha": "^10.0.10",
@@ -159,10 +160,15 @@
     "@typescript-eslint/parser": "^8.18.0",
     "@vscode/test-cli": "^0.0.10",
     "@vscode/test-electron": "^2.5.2",
+    "@vscode/vsce": "^3.9.2",
     "esbuild": "^0.24.0",
     "eslint": "^9.17.0",
     "mocha": "^10.8.2",
     "typescript": "^5.7.2",
     "vitest": "^2.1.8"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/mikesheaksal/vscode-plugin.git"
   }
 }

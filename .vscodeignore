@@ -1,10 +1,17 @@
+.gitignore
 .vscode/**
+.vscode-test/**
+.vscode-test.mjs
 src/**
 proto/**
 docs/**
 node_modules/**
 esbuild.mjs
 eslint.config.mjs
+vitest.config.ts
 tsconfig.json
+tsconfig.test.json
+# out/src is the tsc build used by the integration tests; only the bundle ships.
+out/src/**
 **/*.map
 **/*.ts
