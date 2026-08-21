@@ -1,0 +1,153 @@
+{
+  "name": "acme-alerts",
+  "displayName": "Acme Alerts",
+  "description": "Server-pushed alerts and machine configuration, in the sidebar.",
+  "version": "0.1.0",
+  "publisher": "acme",
+  "license": "UNLICENSED",
+  "private": true,
+  "engines": {
+    "vscode": "^1.90.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "main": "./out/extension.js",
+  "activationEvents": [
+    "onStartupFinished"
+  ],
+  "contributes": {
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "acmeAlerts",
+          "title": "Alerts",
+          "icon": "media/activity-bar.svg"
+        }
+      ]
+    },
+    "views": {
+      "acmeAlerts": [
+        {
+          "id": "acmeAlerts.machine",
+          "name": "Machine",
+          "type": "webview"
+        },
+        {
+          "id": "acmeAlerts.pending",
+          "name": "Alerts",
+          "type": "tree"
+        }
+      ]
+    },
+    "viewsWelcome": [
+      {
+        "view": "acmeAlerts.pending",
+        "contents": "Acme Alerts is not configured yet.\n\nSet the server URL, then provide a client id and a token.\n[Open Settings](command:acmeAlerts.openSettings)\n[Sign In](command:acmeAlerts.signIn)",
+        "when": "acmeAlerts.state == 'unconfigured'"
+      },
+      {
+        "view": "acmeAlerts.pending",
+        "contents": "No alerts. You're all caught up.",
+        "when": "acmeAlerts.state == 'ready'"
+      }
+    ],
+    "commands": [
+      {
+        "command": "acmeAlerts.showMachine",
+        "title": "Show Machine",
+        "category": "Acme Alerts"
+      },
+      {
+        "command": "acmeAlerts.signIn",
+        "title": "Sign In",
+        "category": "Acme Alerts"
+      },
+      {
+        "command": "acmeAlerts.showLog",
+        "title": "Show Log",
+        "category": "Acme Alerts"
+      },
+      {
+        "command": "acmeAlerts.openSettings",
+        "title": "Open Settings",
+        "category": "Acme Alerts"
+      },
+      {
+        "command": "acmeAlerts.refresh",
+        "title": "Refresh",
+        "category": "Acme Alerts",
+        "icon": "$(refresh)"
+      }
+    ],
+    "menus": {
+      "view/title": [
+        {
+          "command": "acmeAlerts.refresh",
+          "when": "view == acmeAlerts.pending || view == acmeAlerts.machine",
+          "group": "navigation"
+        }
+      ],
+      "commandPalette": [
+        {
+          "command": "acmeAlerts.refresh",
+          "when": "false"
+        }
+      ]
+    },
+    "configuration": {
+      "title": "Acme Alerts",
+      "properties": {
+        "acmeAlerts.serverUrl": {
+          "type": "string",
+          "default": "",
+          "scope": "application",
+          "markdownDescription": "Base URL of the alerts server, e.g. `https://alerts.example.com`."
+        },
+        "acmeAlerts.apiToken": {
+          "type": "string",
+          "default": "",
+          "scope": "application",
+          "markdownDescription": "API token. Stored in plain text in `settings.json` and synchronised by Settings Sync \u2014 the extension copies it into secret storage on first read and offers to clear it from here. Prefer the **Acme Alerts: Sign In** command."
+        },
+        "acmeAlerts.tokenFilePath": {
+          "type": "string",
+          "default": "",
+          "scope": "application",
+          "markdownDescription": "Path to a file containing the API token, used when no token is set above or in secret storage. Defaults to `~/.config/acme-alerts/token` (`%APPDATA%\\acme-alerts\\token` on Windows)."
+        },
+        "acmeAlerts.clientIdFilePath": {
+          "type": "string",
+          "default": "",
+          "scope": "application",
+          "markdownDescription": "Path to a file containing this machine's client id, which the server uses to route alerts. Defaults to `~/.config/acme-alerts/client-id` (`%APPDATA%\\acme-alerts\\client-id` on Windows). The extension never generates this value."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "build": "node esbuild.mjs",
+    "watch": "node esbuild.mjs --watch",
+    "typecheck": "tsc --noEmit",
+    "lint": "eslint src",
+    "test": "vitest run",
+    "check": "npm run typecheck && npm run lint && npm run test && npm run build",
+    "vscode:prepublish": "node esbuild.mjs --production",
+    "pretest:integration": "npm run build && tsc -p tsconfig.test.json",
+    "test:integration": "vscode-test"
+  },
+  "devDependencies": {
+    "@types/mocha": "^10.0.10",
+    "@types/node": "^22.10.0",
+    "@types/vscode": "^1.90.0",
+    "@typescript-eslint/eslint-plugin": "^8.18.0",
+    "@typescript-eslint/parser": "^8.18.0",
+    "@vscode/test-cli": "^0.0.10",
+    "@vscode/test-electron": "^2.5.2",
+    "esbuild": "^0.24.0",
+    "eslint": "^9.17.0",
+    "mocha": "^10.8.2",
+    "typescript": "^5.7.2",
+    "vitest": "^2.1.8"
+  }
+}
