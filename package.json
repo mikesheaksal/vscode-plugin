@@ -93,6 +93,23 @@
         "title": "Refresh",
         "category": "Acme Alerts",
         "icon": "$(refresh)"
+      },
+      {
+        "command": "acmeAlerts.showAlert",
+        "title": "Show Alert",
+        "category": "Acme Alerts"
+      },
+      {
+        "command": "acmeAlerts.answerPrimary",
+        "title": "Answer",
+        "category": "Acme Alerts",
+        "icon": "$(check)"
+      },
+      {
+        "command": "acmeAlerts.answerSecondary",
+        "title": "Answer (second option)",
+        "category": "Acme Alerts",
+        "icon": "$(close)"
       }
     ],
     "menus": {
@@ -107,6 +124,30 @@
         {
           "command": "acmeAlerts.refresh",
           "when": "false"
+        },
+        {
+          "command": "acmeAlerts.showAlert",
+          "when": "false"
+        },
+        {
+          "command": "acmeAlerts.answerPrimary",
+          "when": "false"
+        },
+        {
+          "command": "acmeAlerts.answerSecondary",
+          "when": "false"
+        }
+      ],
+      "view/item/context": [
+        {
+          "command": "acmeAlerts.answerPrimary",
+          "when": "view == acmeAlerts.pending && viewItem =~ /^acmeAlert:[12]$/",
+          "group": "inline@1"
+        },
+        {
+          "command": "acmeAlerts.answerSecondary",
+          "when": "view == acmeAlerts.pending && viewItem == acmeAlert:2",
+          "group": "inline@2"
         }
       ]
     },
@@ -123,7 +164,7 @@
           "type": "string",
           "default": "",
           "scope": "application",
-          "markdownDescription": "API token. Stored in plain text in `settings.json` and synchronised by Settings Sync — the extension copies it into secret storage on first read and offers to clear it from here. Prefer the **Acme Alerts: Sign In** command."
+          "markdownDescription": "API token. Stored in plain text in `settings.json` and synchronised by Settings Sync \u2014 the extension copies it into secret storage on first read and offers to clear it from here. Prefer the **Acme Alerts: Sign In** command."
         },
         "acmeAlerts.tokenFilePath": {
           "type": "string",

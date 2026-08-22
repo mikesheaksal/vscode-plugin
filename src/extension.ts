@@ -1,21 +1,25 @@
 import * as vscode from 'vscode';
+import { AlertService } from './alerts/alertService';
+import { ApiClient } from './api/client';
 import { ConfigService } from './config';
 import { Logger } from './log';
 import { StateController } from './state';
-import { AlertsTreeProvider } from './views/alertsTree';
+import { AlertsTreeProvider, PendingAlertItem } from './views/alertsTree';
 import { MachineViewProvider } from './views/machineView';
 
 export function activate(context: vscode.ExtensionContext): void {
   const log = new Logger('Acme Alerts');
   context.subscriptions.push(log);
-  log.info(`Activating ${context.extension.id} ${context.extension.packageJSON.version as string}`);
+
+  const version = context.extension.packageJSON.version as string;
+  log.info(`Activating ${context.extension.id} ${version}`);
 
   const state = new StateController();
   const config = new ConfigService(context.secrets, log);
   context.subscriptions.push(state, config);
 
-  const alerts = new AlertsTreeProvider();
-  context.subscriptions.push(alerts, alerts.register());
+  const alertsTree = new AlertsTreeProvider();
+  context.subscriptions.push(alertsTree, alertsTree.register());
 
   const machine = new MachineViewProvider(context.extensionUri, log);
   context.subscriptions.push(
@@ -26,6 +30,27 @@ export function activate(context: vscode.ExtensionContext): void {
     }),
   );
 
+  /**
+   * Builds a client from whatever credentials currently resolve, or undefined
+   * when the extension is not configured. Rebuilt per call rather than cached,
+   * so a rotated token is picked up without restarting anything.
+   */
+  const clientFor = async (): Promise<ApiClient | undefined> => {
+    const resolved = await config.resolve();
+    if (resolved.kind !== 'ready') {
+      return undefined;
+    }
+    return new ApiClient({
+      baseUrl: resolved.credentials.serverUrl,
+      token: resolved.credentials.token,
+      clientId: resolved.credentials.clientId,
+      clientVersion: version,
+    });
+  };
+
+  const alerts = new AlertService(context.globalState, log, alertsTree, config, clientFor);
+  context.subscriptions.push(alerts);
+
   context.subscriptions.push(
     vscode.commands.registerCommand('acmeAlerts.showMachine', () => machine.reveal()),
     vscode.commands.registerCommand('acmeAlerts.showLog', () => log.show()),
@@ -34,35 +59,68 @@ export function activate(context: vscode.ExtensionContext): void {
     ),
     vscode.commands.registerCommand('acmeAlerts.signIn', () => config.signIn()),
     vscode.commands.registerCommand('acmeAlerts.signOut', () => config.signOut()),
+    vscode.commands.registerCommand('acmeAlerts.showAlert', (target: unknown) =>
+      alerts.showAlert(alertIdOf(target)),
+    ),
+    vscode.commands.registerCommand('acmeAlerts.answerPrimary', (target: unknown) =>
+      alerts.answerWith(alertIdOf(target), 0),
+    ),
+    vscode.commands.registerCommand('acmeAlerts.answerSecondary', (target: unknown) =>
+      alerts.answerWith(alertIdOf(target), 1),
+    ),
     vscode.commands.registerCommand('acmeAlerts.refresh', async () => {
       config.invalidate();
-      alerts.refresh();
       machine.refresh();
-      await syncState(config, state, log);
+      await restart(alerts, config, state, log);
     }),
   );
 
   // ConfigService already watches settings, secret storage and the credential
   // files, so this covers every way credentials can change.
-  context.subscriptions.push(config.onDidChange(() => void syncState(config, state, log)));
+  context.subscriptions.push(
+    config.onDidChange(() => void restart(alerts, config, state, log)),
+  );
 
-  void syncState(config, state, log);
+  void restart(alerts, config, state, log);
 }
 
 export function deactivate(): void {
   // Everything is registered through context.subscriptions.
 }
 
-async function syncState(
+/**
+ * Points the alert service at the current credentials, starting or stopping it
+ * as configuration comes and goes.
+ */
+async function restart(
+  alerts: AlertService,
   config: ConfigService,
   state: StateController,
   log: Logger,
 ): Promise<void> {
   const resolved = await config.resolve();
   await state.set(resolved.kind);
+
+  if (resolved.kind === 'ready') {
+    await alerts.start();
+    return;
+  }
+
+  alerts.stop();
   if (resolved.kind === 'no-client-id') {
-    // Named explicitly because the fix is to create a file, and the user
-    // cannot do that without knowing where it is looked for.
+    // Named explicitly because the fix is to create a file, and the user cannot
+    // do that without knowing where it is looked for.
     log.warn(`No client id found at ${resolved.searchedPath}`);
   }
+}
+
+/**
+ * Commands invoked from a tree item receive the item; invoked from the palette
+ * or a test, they receive an id or nothing.
+ */
+function alertIdOf(target: unknown): string {
+  if (target instanceof PendingAlertItem) {
+    return target.alert.alertId;
+  }
+  return typeof target === 'string' ? target : '';
 }

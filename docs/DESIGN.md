@@ -394,6 +394,12 @@ waste the user's time: report it as "This token is not authorized for client
   not produce a thundering herd. Reset on any successfully received event.
 - After 5 consecutive stream failures, fall back to long-poll
   (`ListPendingAlerts` with `wait_seconds=30`) and retry the stream every 5 minutes.
+- **The polling fallback needs a floor between requests.** `ListPendingAlerts` returns
+  immediately whenever anything is already outstanding, so a client that re-polls as soon
+  as the previous call returns spins as fast as the network allows for as long as the user
+  leaves an alert unanswered. Phase 4 found this the moment a test left an alert sitting.
+  The client waits at least 5s after any poll that came back with alerts; an empty poll
+  already blocked for its full `wait_seconds` and re-polls straight away.
 
 **Implementation note:** the client consumes `fetch(...).body` and splits the NDJSON
 stream on newlines, unwrapping each line's `result` field (§5.1). That is a handful of
@@ -434,7 +440,10 @@ and the view is the durable record.
   answer, since the original notification cannot be reopened.
 - Each tree item carries inline action buttons (`menus: view/item/context`,
   `group: "inline"`) for the alert's one or two responses, so the common case is answered
-  in one click without opening anything.
+  in one click without opening anything. VS Code menus are static, so the item's
+  `contextValue` carries the button count (`acmeAlert:1` / `acmeAlert:2`) and the second
+  action's `when` clause keys off it — a one-button alert must not show a phantom second
+  action.
 - Answered alerts stay in a collapsed "Recent" node for the session, dimmed with the
   chosen response in the item description.
 

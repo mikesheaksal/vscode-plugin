@@ -13,5 +13,12 @@ tsconfig.json
 tsconfig.test.json
 # out/src is the tsc build used by the integration tests; only the bundle ships.
 out/src/**
+# Backend and contract sources: needed to develop, not to run the extension.
+mock/**
+gen/**
+go.mod
+go.sum
+Makefile
+.github/**
 **/*.map
 **/*.ts
