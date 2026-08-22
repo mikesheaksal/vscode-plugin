@@ -1,8 +1,9 @@
 import * as vscode from 'vscode';
-import { AlertOutcome, type Alert } from '../gen/acme/alerts/v1/alerts_pb';
+import { AlertOutcome, type Alert, type Event } from '../gen/acme/alerts/v1/alerts_pb';
 import { Severity } from '../gen/acme/alerts/v1/alerts_pb';
 import type { ApiClient } from '../api/client';
 import { ApiError, NetworkError } from '../api/errors';
+import { EventStream, type StreamState } from '../api/eventStream';
 import type { ConfigService } from '../config';
 import {
   EMPTY_STATE,
@@ -10,6 +11,7 @@ import {
   findPending,
   markAnswered,
   markNotified,
+  markRevoked,
   receive,
   reconcile,
   unnotified,
@@ -48,10 +50,23 @@ export const vscodeNotifier: Notifier = {
 };
 
 const STATE_KEY = 'acmeAlerts.alerts';
+const SEQUENCE_KEY = 'acmeAlerts.lastSequence';
 const MIN_BACKOFF_MS = 1_000;
 const MAX_BACKOFF_MS = 60_000;
 
 export interface AlertServiceOptions {
+  /** Skip the event stream and poll only. Used by tests of the fallback path. */
+  pollOnly?: boolean;
+  /** Passed through to EventStream. */
+  heartbeatTimeoutMs?: number;
+  failuresBeforeDegraded?: number;
+  minBackoffMs?: number;
+  maxBackoffMs?: number;
+  /**
+   * How long freshly arrived alerts are collected before announcing them, so a
+   * burst over the stream is one decision rather than one per event.
+   */
+  announceDebounceMs?: number;
   /** How long each poll asks the server to block for. */
   pollWaitSeconds?: number;
   /**
@@ -67,17 +82,24 @@ export interface AlertServiceOptions {
 /**
  * Receives alerts, shows them, and posts the user's answer back.
  *
- * Phase 4 polls with `ListPendingAlerts`; Phase 5 replaces the loop with the
- * event stream and keeps this class's responsibilities unchanged. The polling
- * path stays either way as the fallback for proxies that buffer the stream.
+ * The event stream is the primary source. Polling remains as the fallback for
+ * environments where a proxy buffers the streaming response into uselessness,
+ * and runs only while the stream reports itself degraded.
  */
 export class AlertService implements vscode.Disposable {
   private state: AlertStoreState;
   private running = false;
   private backoffMs = MIN_BACKOFF_MS;
   private abort: AbortController | undefined;
+  private stream: EventStream | undefined;
+  private polling = false;
+  private lastSequence: bigint;
   private readonly pollWaitSeconds: number;
   private readonly minIntervalMs: number;
+  private readonly options: AlertServiceOptions;
+  private readonly announceQueue: AlertRecord[] = [];
+  private announceTimer: ReturnType<typeof setTimeout> | undefined;
+  private readonly announceDebounceMs: number;
   /** Set after a 401 so a bad token produces one prompt, not a prompt per poll. */
   private reauthAttempted = false;
 
@@ -91,8 +113,12 @@ export class AlertService implements vscode.Disposable {
     options: AlertServiceOptions = {},
   ) {
     this.state = this.memento.get<AlertStoreState>(STATE_KEY) ?? EMPTY_STATE;
+    this.options = options;
     this.pollWaitSeconds = options.pollWaitSeconds ?? 30;
     this.minIntervalMs = options.minIntervalMs ?? 5_000;
+    this.announceDebounceMs = options.announceDebounceMs ?? 300;
+    // Stored as a string: JSON has no bigint, and uint64 does not fit a number.
+    this.lastSequence = BigInt(this.memento.get<string>(SEQUENCE_KEY) ?? '0');
   }
 
   /**
@@ -119,15 +145,42 @@ export class AlertService implements vscode.Disposable {
       void this.showSummary(outstanding);
     }
 
-    if (!this.running) {
-      this.running = true;
-      void this.poll();
+    if (this.running) {
+      return;
     }
+    this.running = true;
+
+    if (this.options.pollOnly) {
+      this.startPolling();
+      return;
+    }
+
+    this.stream = new EventStream({
+      clientFor: this.clientFor,
+      onEvent: (event) => this.onStreamEvent(event),
+      onStateChange: (state, detail) => void this.onStreamState(state, detail),
+      onFatal: (error) => void this.onFatal(error),
+      log: this.log,
+      ...pick(this.options, [
+        'heartbeatTimeoutMs',
+        'failuresBeforeDegraded',
+        'minBackoffMs',
+        'maxBackoffMs',
+      ]),
+    });
+    this.stream.start(this.lastSequence);
   }
 
   stop(): void {
     this.running = false;
+    this.polling = false;
+    if (this.announceTimer !== undefined) {
+      clearTimeout(this.announceTimer);
+      this.announceTimer = undefined;
+    }
     this.abort?.abort();
+    this.stream?.stop();
+    this.stream = undefined;
   }
 
   /** Re-presents an alert as a modal, for one selected in the view. */
@@ -156,15 +209,95 @@ export class AlertService implements vscode.Disposable {
   }
 
   // -------------------------------------------------------------------------
-  // Polling
+  // Event stream
   // -------------------------------------------------------------------------
 
+  private async onStreamEvent(event: Event): Promise<void> {
+    switch (event.payload.case) {
+      case 'alert':
+        await this.ingest([event.payload.value], false);
+        break;
+      case 'alertRevoked': {
+        const alertId = event.payload.value.alertId;
+        this.log.info(`Alert ${alertId} withdrawn by the server`);
+        this.state = markRevoked(this.state, alertId);
+        await this.persist();
+        // The notification for it cannot be closed programmatically, so the
+        // view is where the withdrawal becomes visible (design section 7.4).
+        break;
+      }
+      case 'machineConfigChanged':
+        // Phase 6b consumes this to refresh the form.
+        this.log.debug('Machine configuration changed');
+        break;
+      case 'heartbeat':
+        break;
+      default:
+        break;
+    }
+    await this.rememberSequence();
+  }
+
+  private async onStreamState(state: StreamState, detail?: string): Promise<void> {
+    this.log.debug(`Stream ${state}${detail ? `: ${detail}` : ''}`);
+
+    if (state === 'connected') {
+      // The server is authoritative about what is still live, so reconcile on
+      // every (re)connect: anything answered or withdrawn during an outage is
+      // absent from this list even though no event announced it.
+      this.polling = false;
+      await this.catchUp();
+      return;
+    }
+
+    if (state === 'degraded' && !this.polling) {
+      // Probably a proxy buffering the stream. Fall back rather than leaving
+      // the user with nothing.
+      this.log.warn('Event stream unavailable; falling back to polling.');
+      this.startPolling();
+    }
+  }
+
+  private async onFatal(error: ApiError): Promise<void> {
+    const stop = await this.handlePollError(error);
+    if (stop) {
+      this.stop();
+    }
+  }
+
+  /** One non-blocking poll, used to reconcile after connecting. */
+  private async catchUp(): Promise<void> {
+    const client = await this.clientFor();
+    if (!client) {
+      return;
+    }
+    try {
+      const response = await client.listPendingAlerts(0);
+      await this.ingest(response.alerts, true);
+    } catch (error) {
+      this.log.debug('Catch-up poll failed', error);
+    }
+  }
+
+  // -------------------------------------------------------------------------
+  // Polling fallback
+  // -------------------------------------------------------------------------
+
+  private startPolling(): void {
+    if (this.polling) {
+      return;
+    }
+    this.polling = true;
+    void this.poll();
+  }
+
   private async poll(): Promise<void> {
-    while (this.running) {
+    while (this.running && this.polling) {
       const client = await this.clientFor();
       if (!client) {
         // Not configured yet. ConfigService fires onDidChange when that
         // changes, and the extension restarts us.
+        this.polling = false;
         this.running = false;
         return;
       }
@@ -172,7 +305,7 @@ export class AlertService implements vscode.Disposable {
       this.abort = new AbortController();
       try {
         const response = await client.listPendingAlerts(this.pollWaitSeconds, this.abort.signal);
-        await this.ingest(response.alerts);
+        await this.ingest(response.alerts, true);
         this.backoffMs = MIN_BACKOFF_MS;
         this.reauthAttempted = false;
 
@@ -182,11 +315,12 @@ export class AlertService implements vscode.Disposable {
           await delay(this.minIntervalMs);
         }
       } catch (error) {
-        if (!this.running) {
+        if (!this.running || !this.polling) {
           return;
         }
         const stop = await this.handlePollError(error);
         if (stop) {
+          this.polling = false;
           this.running = false;
           return;
         }
@@ -242,38 +376,69 @@ export class AlertService implements vscode.Disposable {
     }
   }
 
-  private async ingest(alerts: Alert[]): Promise<void> {
+  /**
+   * Folds alerts into the store.
+   *
+   * `authoritative` must be true only for a complete list from
+   * ListPendingAlerts. Reconciling against a stream event would drop every
+   * other outstanding alert, since a single event is not a list of what is
+   * live - it is one thing that happened.
+   */
+  private async ingest(alerts: Alert[], authoritative: boolean): Promise<void> {
     const records = alerts.map(toRecord);
 
     const received = receive(this.state, records);
-    // The server is authoritative about what is still live, so anything held
-    // locally but absent here was answered elsewhere or withdrawn.
-    this.state = reconcile(
-      received.state,
-      records.map((record) => record.alertId),
-    );
+    this.state = authoritative
+      ? reconcile(
+          received.state,
+          records.map((record) => record.alertId),
+        )
+      : received.state;
 
     if (received.fresh.length > 0) {
       this.log.info(`Received ${received.fresh.length} new alert(s)`);
-    }
-
-    const announcement = announcementFor(received.fresh, this.state.pending.length);
-    if (announcement.kind !== 'none') {
+      // Marked before the announcement is decided: the announcement is
+      // debounced, and a redelivery in the meantime must not re-queue it.
       this.state = markNotified(
         this.state,
         received.fresh.map((alert) => alert.alertId),
       );
+      this.queueAnnouncement(received.fresh);
     }
 
     await this.persist();
+  }
 
-    if (announcement.kind === 'individual') {
-      for (const alert of announcement.alerts) {
-        void this.present(alert, alert.modal);
-      }
-    } else if (announcement.kind === 'summary') {
-      void this.showSummary(announcement.outstanding);
+  /**
+   * Collects freshly arrived alerts briefly before announcing them.
+   *
+   * Over the stream, alerts arrive one event at a time, so a batch is not a
+   * useful unit: six alerts in quick succession would otherwise produce three
+   * individual notifications and then summaries. A short window turns them
+   * back into one decision.
+   */
+  private queueAnnouncement(fresh: AlertRecord[]): void {
+    this.announceQueue.push(...fresh);
+    if (this.announceTimer !== undefined) {
+      return;
     }
+    this.announceTimer = setTimeout(() => {
+      this.announceTimer = undefined;
+      // Anything already resolved during the debounce window is dropped: an
+      // alert replayed and withdrawn in the same breath should not produce a
+      // notification for something that is no longer there.
+      const queued = this.announceQueue
+        .splice(0)
+        .filter((alert) => findPending(this.state, alert.alertId) !== undefined);
+      const announcement = announcementFor(queued, this.state.pending.length);
+      if (announcement.kind === 'individual') {
+        for (const alert of announcement.alerts) {
+          void this.present(alert, alert.modal);
+        }
+      } else if (announcement.kind === 'summary') {
+        void this.showSummary(announcement.outstanding);
+      }
+    }, this.announceDebounceMs);
   }
 
   // -------------------------------------------------------------------------
@@ -396,6 +561,15 @@ export class AlertService implements vscode.Disposable {
     }
   }
 
+  private async rememberSequence(): Promise<void> {
+    const sequence = this.stream?.sequence ?? this.lastSequence;
+    if (sequence === this.lastSequence) {
+      return;
+    }
+    this.lastSequence = sequence;
+    await this.memento.update(SEQUENCE_KEY, sequence.toString());
+  }
+
   private async persist(): Promise<void> {
     this.tree.update(this.state);
     await this.memento.update(STATE_KEY, this.state);
@@ -441,4 +615,15 @@ function nextBackoff(current: number): number {
 
 function delay(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/** Copies only the keys that are set, which `exactOptionalPropertyTypes` requires. */
+function pick<T extends object, K extends keyof T>(source: T, keys: K[]): Partial<Pick<T, K>> {
+  const result: Partial<Pick<T, K>> = {};
+  for (const key of keys) {
+    if (source[key] !== undefined) {
+      result[key] = source[key];
+    }
+  }
+  return result;
 }

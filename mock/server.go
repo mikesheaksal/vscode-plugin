@@ -59,7 +59,11 @@ type server struct {
 	events   []*alertsv1.Event
 	// subscribers receive every event appended after they registered.
 	subscribers map[int]chan *alertsv1.Event
-	nextSub     int
+	// drops lets the admin endpoint cut live streams without restarting the
+	// process, so a test can lose the connection while the event log survives -
+	// what a load balancer restart or an idle timeout looks like from here.
+	drops   map[int]chan struct{}
+	nextSub int
 
 	// alerts still awaiting a response, by alert id.
 	pending   map[string]*alertsv1.Alert
@@ -82,6 +86,7 @@ func newServer(clients map[string]string, applyDelay time.Duration) *server {
 	s := &server{
 		clients:       clients,
 		subscribers:   map[int]chan *alertsv1.Event{},
+		drops:         map[int]chan struct{}{},
 		pending:       map[string]*alertsv1.Alert{},
 		responses:     map[string]*alertsv1.RespondToAlertRequest{},
 		config:        map[string]*alertsv1.ResourceSpec{},
@@ -151,7 +156,7 @@ func (s *server) SubscribeEvents(req *alertsv1.SubscribeEventsRequest, stream gr
 		return err
 	}
 
-	backlog, updates, unsubscribe := s.subscribe(req.GetLastSequence())
+	backlog, updates, dropped, unsubscribe := s.subscribe(req.GetLastSequence())
 	defer unsubscribe()
 
 	// An immediate heartbeat, before anything else. grpc-gateway does not flush
@@ -176,6 +181,8 @@ func (s *server) SubscribeEvents(req *alertsv1.SubscribeEventsRequest, stream gr
 		select {
 		case <-stream.Context().Done():
 			return nil
+		case <-dropped:
+			return status.Error(codes.Unavailable, "connection dropped")
 		case event := <-updates:
 			if err := stream.Send(event); err != nil {
 				return err
@@ -417,7 +424,7 @@ func (s *server) completeChange(clientID, changeID string) {
 // Event plumbing
 // ---------------------------------------------------------------------------
 
-func (s *server) subscribe(after uint64) ([]*alertsv1.Event, <-chan *alertsv1.Event, func()) {
+func (s *server) subscribe(after uint64) ([]*alertsv1.Event, <-chan *alertsv1.Event, <-chan struct{}, func()) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -431,14 +438,40 @@ func (s *server) subscribe(after uint64) ([]*alertsv1.Event, <-chan *alertsv1.Ev
 	id := s.nextSub
 	s.nextSub++
 	channel := make(chan *alertsv1.Event, 64)
+	drop := make(chan struct{})
 	s.subscribers[id] = channel
+	s.drops[id] = drop
 
-	return backlog, channel, func() {
+	return backlog, channel, drop, func() {
 		s.mu.Lock()
 		defer s.mu.Unlock()
 		delete(s.subscribers, id)
+		delete(s.drops, id)
 		close(channel)
 	}
+}
+
+// liveStreams reports how many streams are connected, so a test can wait for a
+// client to reconnect rather than guessing at a delay.
+func (s *server) liveStreams() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return len(s.drops)
+}
+
+// dropAll cuts every live stream. The event log is untouched, so reconnecting
+// clients replay from last_sequence exactly as they would after a real network
+// interruption.
+func (s *server) dropAll() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	count := 0
+	for id, drop := range s.drops {
+		close(drop)
+		delete(s.drops, id)
+		count++
+	}
+	return count
 }
 
 // appendLocked assigns the next sequence and records the event. The caller

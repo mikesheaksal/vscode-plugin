@@ -47,12 +47,25 @@ describe('receive', () => {
     expect(second.state.pending).toHaveLength(1);
   });
 
-  it('never re-notifies an alert it has seen before, even if it fell out of pending', () => {
+  it('never resurrects an alert the user already answered', () => {
     // The user answered it, then the server redelivered before its own view of
-    // the world caught up. Showing the notification again would be a bug.
+    // the world caught up - which a stream reconnect makes routine. Putting it
+    // back would bounce it between pending and recent on every replay.
     const first = receive(EMPTY_STATE, [alert('a')], NOW);
     const answered = markAnswered(first.state, 'a', 'Approve', NOW);
     const redelivered = receive(answered, [alert('a')], NOW);
+
+    expect(redelivered.fresh).toEqual([]);
+    expect(redelivered.state.pending).toEqual([]);
+    expect(redelivered.state.recent).toHaveLength(1);
+  });
+
+  it('restores an alert dropped locally that the server still lists, without notifying', () => {
+    // Distinct from the case above: this one was never resolved here, so the
+    // server listing it means it really is still outstanding.
+    const first = receive(EMPTY_STATE, [alert('a')], NOW);
+    const lost = { ...first.state, pending: [] };
+    const redelivered = receive(lost, [alert('a')], NOW);
 
     expect(redelivered.fresh).toEqual([]);
     expect(redelivered.state.pending).toHaveLength(1);

@@ -426,6 +426,24 @@ Two behaviours worth knowing, because they shape the UX:
   `undefined` on dismissal. **There is no API to close a notification programmatically.**
   This matters in §9.3.
 
+### 7.2a Coalescing is a time window, not a batch
+
+The earlier draft decided individual-versus-summary per batch of arriving alerts, which
+worked while polling returned alerts in groups. Over the stream each alert is its own
+event, so six arriving together produced three individual notifications and then
+summaries — the exact stacking the rule exists to prevent. Phase 5 found this the moment
+the stream replaced polling.
+
+Fresh alerts are therefore collected for a short window (300ms) before anything is shown,
+and the individual-or-summary decision is made once over that window. Two things fall out
+of it:
+
+- The window is the same code path for both sources, so polling and streaming announce
+  identically.
+- An alert that is withdrawn inside the window is dropped from the announcement rather
+  than announced and immediately removed. Replay after a reconnect makes that sequence
+  ordinary, not exotic.
+
 ### 7.3 Alert bursts, and the alerts view
 
 Ten alerts at once produce ten stacked notifications, and the user will miss most of them.
@@ -465,9 +483,14 @@ the server withdraws it. Two things follow:
   any are outstanding. Replaying six-day-old notifications at every window open is how
   users learn to click things away without reading them.
 
-`ListPendingAlerts` on activation is the reconciliation step: the server is authoritative
-about what is still live, so anything persisted locally but absent from that response was
-answered or revoked while we were away, and is dropped.
+`ListPendingAlerts` on activation, and on every stream (re)connect, is the reconciliation
+step: the server is authoritative about what is still live, so anything persisted locally
+but absent from that response was answered or revoked while we were away, and is dropped.
+
+**Reconciliation must only ever run against that complete list.** A stream event is one
+thing that happened, not a statement about what is outstanding; treating a single-alert
+event as authoritative silently discards every other pending alert. Phase 5 shipped that
+bug for exactly as long as it took the end-to-end tests to run.
 
 **Revocation** arrives as an `AlertRevoked` event. The alert is removed from the view and
 the badge decrements. If its notification is still on screen it cannot be closed

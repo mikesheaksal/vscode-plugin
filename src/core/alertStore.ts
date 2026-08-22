@@ -79,6 +79,7 @@ export function receive(
 ): ReceiveResult {
   const seenIds = new Set(state.seen.map((entry) => entry.alertId));
   const pendingIds = new Set(state.pending.map((entry) => entry.alert.alertId));
+  const resolvedIds = new Set(state.recent.map((entry) => entry.alert.alertId));
 
   const fresh: AlertRecord[] = [];
   const pending = [...state.pending];
@@ -86,9 +87,11 @@ export function receive(
 
   for (const alert of incoming) {
     if (seenIds.has(alert.alertId)) {
-      // Already known. Re-add to pending if it was somehow dropped locally
-      // while the server still considers it live, but never re-notify.
-      if (!pendingIds.has(alert.alertId)) {
+      // Already known. Re-add to pending if it was dropped locally while the
+      // server still considers it live, but never re-notify - and never
+      // resurrect one the user has already answered, which would otherwise
+      // bounce between pending and recent on every redelivery.
+      if (!pendingIds.has(alert.alertId) && !resolvedIds.has(alert.alertId)) {
         pending.push({ alert, notified: true, receivedAt: now.toISOString() });
         pendingIds.add(alert.alertId);
       }

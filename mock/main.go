@@ -176,6 +176,14 @@ func withAdmin(service *server, gateway http.Handler) http.Handler {
 		writeJSON(w, map[string]string{"revoked": r.PathValue("id")})
 	})
 
+	mux.HandleFunc("GET /admin/streams", func(w http.ResponseWriter, _ *http.Request) {
+		writeJSON(w, map[string]int{"streams": service.liveStreams()})
+	})
+
+	mux.HandleFunc("POST /admin/drop", func(w http.ResponseWriter, _ *http.Request) {
+		writeJSON(w, map[string]int{"dropped": service.dropAll()})
+	})
+
 	mux.Handle("/", gateway)
 	return mux
 }
