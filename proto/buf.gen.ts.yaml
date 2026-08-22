@@ -1,0 +1,21 @@
+# TypeScript output for the VS Code extension.
+#
+# The extension speaks JSON to the gateway rather than gRPC, but generating its
+# types from the same contract means a field rename breaks the TypeScript build
+# instead of a user's form.
+#
+# google/rpc is included because the client parses google.rpc.Status and its
+# BadRequest detail to map field violations onto form inputs. google/api is
+# included only because the generated file descriptor references it; the client
+# never touches the HTTP annotations.
+version: v2
+inputs:
+  - directory: .
+    paths:
+      - acme
+      - third_party/google/rpc
+      - third_party/google/api
+plugins:
+  - local: ../node_modules/.bin/protoc-gen-es
+    out: ../src/gen
+    opt: target=ts

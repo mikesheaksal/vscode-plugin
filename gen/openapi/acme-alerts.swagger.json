@@ -1,0 +1,822 @@
+{
+  "swagger": "2.0",
+  "info": {
+    "title": "acme/alerts/v1/alerts.proto",
+    "description": "Contract between the VS Code extension and the Go backend.\n\nThe backend serves gRPC; grpc-gateway projects the same service onto the\nJSON/HTTP paths in the google.api.http annotations below, and that projection\nis what the extension talks to. See docs/DESIGN.md §5 for the gateway\nspecifics the client depends on (streaming envelope, JSON field naming,\nstatus-code mapping).",
+    "version": "version not set"
+  },
+  "tags": [
+    {
+      "name": "AlertService"
+    }
+  ],
+  "consumes": [
+    "application/json"
+  ],
+  "produces": [
+    "application/json"
+  ],
+  "paths": {
+    "/api/v1/alerts/{alertId}/response": {
+      "post": {
+        "summary": "Records the user's answer. Idempotent on idempotency_key.",
+        "operationId": "AlertService_RespondToAlert",
+        "responses": {
+          "200": {
+            "description": "A successful response.",
+            "schema": {
+              "$ref": "#/definitions/v1RespondToAlertResponse"
+            }
+          },
+          "default": {
+            "description": "An unexpected error response.",
+            "schema": {
+              "$ref": "#/definitions/rpcStatus"
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "alertId",
+            "in": "path",
+            "required": true,
+            "type": "string"
+          },
+          {
+            "name": "body",
+            "in": "body",
+            "required": true,
+            "schema": {
+              "$ref": "#/definitions/AlertServiceRespondToAlertBody"
+            }
+          }
+        ],
+        "tags": [
+          "AlertService"
+        ]
+      }
+    },
+    "/api/v1/alerts:pending": {
+      "get": {
+        "summary": "Fallback for environments where the streaming response is buffered by a\nproxy, and the catch-up call made on activation before subscribing.\nBlocks up to wait_seconds for an alert to arrive; returns immediately if\nany are already pending.",
+        "operationId": "AlertService_ListPendingAlerts",
+        "responses": {
+          "200": {
+            "description": "A successful response.",
+            "schema": {
+              "$ref": "#/definitions/v1ListPendingAlertsResponse"
+            }
+          },
+          "default": {
+            "description": "An unexpected error response.",
+            "schema": {
+              "$ref": "#/definitions/rpcStatus"
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "clientId",
+            "in": "query",
+            "required": false,
+            "type": "string"
+          },
+          {
+            "name": "waitSeconds",
+            "description": "0 returns immediately. Capped server-side; 30 is the client's default.",
+            "in": "query",
+            "required": false,
+            "type": "integer",
+            "format": "int64"
+          }
+        ],
+        "tags": [
+          "AlertService"
+        ]
+      }
+    },
+    "/api/v1/client": {
+      "get": {
+        "summary": "Validates the token, confirms the client_id is known, and reports the\nminimum client version the server will accept. Called once on activation.",
+        "operationId": "AlertService_GetClientInfo",
+        "responses": {
+          "200": {
+            "description": "A successful response.",
+            "schema": {
+              "$ref": "#/definitions/v1GetClientInfoResponse"
+            }
+          },
+          "default": {
+            "description": "An unexpected error response.",
+            "schema": {
+              "$ref": "#/definitions/rpcStatus"
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "clientId",
+            "description": "Opaque routing identifier read from the client-id file on the user's\nmachine (docs/DESIGN.md §6). Not a credential: the bearer token is. The\nserver MUST verify that the presented token is authorized for this\nclient_id, or any token holder could receive another client's alerts.",
+            "in": "query",
+            "required": false,
+            "type": "string"
+          }
+        ],
+        "tags": [
+          "AlertService"
+        ]
+      }
+    },
+    "/api/v1/events": {
+      "get": {
+        "summary": "Long-lived server stream of alerts and lifecycle events.",
+        "description": "Over grpc-gateway this is a chunked HTTP response carrying one JSON object\nper line, each wrapped as {\"result\": \u003cEvent\u003e}. It is NOT Server-Sent\nEvents: there is no \"data:\" framing and no EventSource-compatible\nreconnect. Resumption is by last_sequence, not the Last-Event-ID header.",
+        "operationId": "AlertService_SubscribeEvents",
+        "responses": {
+          "200": {
+            "description": "A successful response.(streaming responses)",
+            "schema": {
+              "type": "object",
+              "properties": {
+                "result": {
+                  "$ref": "#/definitions/v1Event"
+                },
+                "error": {
+                  "$ref": "#/definitions/rpcStatus"
+                }
+              },
+              "title": "Stream result of v1Event"
+            }
+          },
+          "default": {
+            "description": "An unexpected error response.",
+            "schema": {
+              "$ref": "#/definitions/rpcStatus"
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "clientId",
+            "in": "query",
+            "required": false,
+            "type": "string"
+          },
+          {
+            "name": "lastSequence",
+            "description": "Highest Event.sequence the client has already processed. The server\nreplays everything after it. Zero (or absent) means \"send me everything\ncurrently outstanding\".",
+            "in": "query",
+            "required": false,
+            "type": "string",
+            "format": "uint64"
+          },
+          {
+            "name": "clientVersion",
+            "description": "Reported so the server can log version skew against a fleet it cannot\nupdate. Advisory only.",
+            "in": "query",
+            "required": false,
+            "type": "string"
+          }
+        ],
+        "tags": [
+          "AlertService"
+        ]
+      }
+    },
+    "/api/v1/machine/changes/{changeId}:cancel": {
+      "post": {
+        "summary": "Aborts a change that is still within its cancellation window\n(MachineChange.cancellable_until). Past that point the server returns\nFAILED_PRECONDITION and the change runs to completion.",
+        "operationId": "AlertService_CancelMachineChange",
+        "responses": {
+          "200": {
+            "description": "A successful response.",
+            "schema": {
+              "$ref": "#/definitions/v1CancelMachineChangeResponse"
+            }
+          },
+          "default": {
+            "description": "An unexpected error response.",
+            "schema": {
+              "$ref": "#/definitions/rpcStatus"
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "changeId",
+            "in": "path",
+            "required": true,
+            "type": "string"
+          },
+          {
+            "name": "body",
+            "in": "body",
+            "required": true,
+            "schema": {
+              "$ref": "#/definitions/AlertServiceCancelMachineChangeBody"
+            }
+          }
+        ],
+        "tags": [
+          "AlertService"
+        ]
+      }
+    },
+    "/api/v1/machine/config": {
+      "get": {
+        "summary": "Everything the form needs to render: the GPU catalogue, the machine's\ncurrent configuration, the numeric bounds, and any change already in\nflight. One call, so the form cannot render half-configured.",
+        "operationId": "AlertService_GetMachineConfig",
+        "responses": {
+          "200": {
+            "description": "A successful response.",
+            "schema": {
+              "$ref": "#/definitions/v1GetMachineConfigResponse"
+            }
+          },
+          "default": {
+            "description": "An unexpected error response.",
+            "schema": {
+              "$ref": "#/definitions/rpcStatus"
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "clientId",
+            "in": "query",
+            "required": false,
+            "type": "string"
+          }
+        ],
+        "tags": [
+          "AlertService"
+        ]
+      }
+    },
+    "/api/v1/machine/config:apply": {
+      "post": {
+        "summary": "Applies a new configuration to the machine directly — there is no approval\nstep. Idempotent on idempotency_key, and guarded by expected_version so a\nform rendered from stale data cannot silently clobber a concurrent change.",
+        "description": "Returns as soon as the change is accepted; completion arrives as a\nMachineConfigChanged event on the stream.",
+        "operationId": "AlertService_ApplyMachineConfig",
+        "responses": {
+          "200": {
+            "description": "A successful response.",
+            "schema": {
+              "$ref": "#/definitions/v1ApplyMachineConfigResponse"
+            }
+          },
+          "default": {
+            "description": "An unexpected error response.",
+            "schema": {
+              "$ref": "#/definitions/rpcStatus"
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "body",
+            "in": "body",
+            "required": true,
+            "schema": {
+              "$ref": "#/definitions/v1ApplyMachineConfigRequest"
+            }
+          }
+        ],
+        "tags": [
+          "AlertService"
+        ]
+      }
+    },
+    "/api/v1/machine/config:preview": {
+      "post": {
+        "summary": "Computes what applying a spec would do, without doing it: whether it needs\na restart, which specific edits force that, and any validation errors.",
+        "description": "Called immediately before the confirmation dialog, so the dialog states\nreal consequences rather than guesses. Restarts are NOT required by every\nchange, and only the server knows which ones need one. This doubles as\npre-flight validation: the user should never confirm a change that is then\nrejected.",
+        "operationId": "AlertService_PreviewMachineConfig",
+        "responses": {
+          "200": {
+            "description": "A successful response.",
+            "schema": {
+              "$ref": "#/definitions/v1PreviewMachineConfigResponse"
+            }
+          },
+          "default": {
+            "description": "An unexpected error response.",
+            "schema": {
+              "$ref": "#/definitions/rpcStatus"
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "body",
+            "in": "body",
+            "required": true,
+            "schema": {
+              "$ref": "#/definitions/v1PreviewMachineConfigRequest"
+            }
+          }
+        ],
+        "tags": [
+          "AlertService"
+        ]
+      }
+    }
+  },
+  "definitions": {
+    "AlertServiceCancelMachineChangeBody": {
+      "type": "object",
+      "properties": {
+        "clientId": {
+          "type": "string"
+        }
+      }
+    },
+    "AlertServiceRespondToAlertBody": {
+      "type": "object",
+      "properties": {
+        "clientId": {
+          "type": "string"
+        },
+        "outcome": {
+          "$ref": "#/definitions/v1AlertOutcome"
+        },
+        "buttonId": {
+          "type": "string",
+          "description": "Set only when outcome is ANSWERED; must match one of the alert's buttons."
+        },
+        "respondedAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "idempotencyKey": {
+          "type": "string",
+          "description": "Generated once per user action and reused across retries. Replaying the\nsame key returns the original result; a different answer to an already\nanswered alert is ABORTED (409)."
+        }
+      }
+    },
+    "protobufAny": {
+      "type": "object",
+      "properties": {
+        "@type": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": {}
+    },
+    "rpcStatus": {
+      "type": "object",
+      "properties": {
+        "code": {
+          "type": "integer",
+          "format": "int32"
+        },
+        "message": {
+          "type": "string"
+        },
+        "details": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "$ref": "#/definitions/protobufAny"
+          }
+        }
+      }
+    },
+    "v1Alert": {
+      "type": "object",
+      "properties": {
+        "alertId": {
+          "type": "string"
+        },
+        "severity": {
+          "$ref": "#/definitions/v1Severity"
+        },
+        "title": {
+          "type": "string"
+        },
+        "message": {
+          "type": "string"
+        },
+        "modal": {
+          "type": "boolean",
+          "description": "Blocks the editor until answered. Expensive to the user's attention;\nreserve for alerts that genuinely cannot wait."
+        },
+        "buttons": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "$ref": "#/definitions/v1AlertButton"
+          },
+          "description": "Zero to two. The client truncates anything longer rather than failing,\nand synthesises an \"OK\" button if empty — a VS Code notification without\nbuttons auto-hides and would be missed."
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      }
+    },
+    "v1AlertButton": {
+      "type": "object",
+      "properties": {
+        "buttonId": {
+          "type": "string"
+        },
+        "label": {
+          "type": "string"
+        },
+        "isPrimary": {
+          "type": "boolean"
+        }
+      }
+    },
+    "v1AlertOutcome": {
+      "type": "string",
+      "enum": [
+        "ALERT_OUTCOME_UNSPECIFIED",
+        "ALERT_OUTCOME_ANSWERED",
+        "ALERT_OUTCOME_DISMISSED"
+      ],
+      "default": "ALERT_OUTCOME_UNSPECIFIED",
+      "description": " - ALERT_OUTCOME_DISMISSED: The user closed the notification without choosing a button. Reported so\nthe server can distinguish \"seen and ignored\" from \"never delivered\"; the\nalert stays outstanding."
+    },
+    "v1AlertRevoked": {
+      "type": "object",
+      "properties": {
+        "alertId": {
+          "type": "string"
+        },
+        "reason": {
+          "type": "string",
+          "description": "Shown to the user if the alert was on screen. Optional."
+        }
+      },
+      "description": "Alerts have no client-side expiry: an unanswered alert persists across\nrestarts until the user answers it or the server withdraws it with this."
+    },
+    "v1ApplyMachineConfigRequest": {
+      "type": "object",
+      "properties": {
+        "clientId": {
+          "type": "string"
+        },
+        "spec": {
+          "$ref": "#/definitions/v1ResourceSpec",
+          "description": "The complete desired configuration, not a delta. The server diffs it\nagainst what is current; sending the whole spec means an old client and a\nnew server cannot disagree about which fields were \"left alone\"."
+        },
+        "idempotencyKey": {
+          "type": "string",
+          "description": "Generated once per apply attempt and reused across retries, so a response\nlost to a dropped connection can be replayed safely."
+        },
+        "expectedVersion": {
+          "type": "string",
+          "description": "GetMachineConfigResponse.version the form was rendered from. A mismatch is\nABORTED (409) and the client refetches and shows what changed, rather than\noverwriting it."
+        },
+        "clientVersion": {
+          "type": "string"
+        }
+      }
+    },
+    "v1ApplyMachineConfigResponse": {
+      "type": "object",
+      "properties": {
+        "change": {
+          "$ref": "#/definitions/v1MachineChange"
+        },
+        "serverTime": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Anchor for rendering the cancellation countdown without depending on how\nrecently a heartbeat arrived."
+        }
+      }
+    },
+    "v1CancelMachineChangeResponse": {
+      "type": "object",
+      "properties": {
+        "change": {
+          "$ref": "#/definitions/v1MachineChange"
+        }
+      }
+    },
+    "v1ChangeEffect": {
+      "type": "object",
+      "properties": {
+        "fieldPath": {
+          "type": "string",
+          "description": "Proto path of the changed field, e.g. \"spec.ram_gb\". Matches the paths\nused in google.rpc.BadRequest violations, so the client has one mapping\nfrom path to input."
+        },
+        "description": {
+          "type": "string",
+          "description": "Human-readable, shown beside the field's before/after in the dialog,\ne.g. \"Requires a restart\"."
+        },
+        "requiresRestart": {
+          "type": "boolean"
+        }
+      }
+    },
+    "v1ChangeStatus": {
+      "type": "string",
+      "enum": [
+        "CHANGE_STATUS_UNSPECIFIED",
+        "CHANGE_STATUS_APPLYING",
+        "CHANGE_STATUS_APPLIED",
+        "CHANGE_STATUS_FAILED",
+        "CHANGE_STATUS_CANCELLING",
+        "CHANGE_STATUS_CANCELLED"
+      ],
+      "default": "CHANGE_STATUS_UNSPECIFIED",
+      "description": " - CHANGE_STATUS_FAILED: Machine is back on its previous configuration.\n - CHANGE_STATUS_CANCELLING: Cancel accepted, revert in progress.\n - CHANGE_STATUS_CANCELLED: Cancelled and reverted. Terminal, and indistinguishable from FAILED in\nits effect on the machine — the distinction is whose decision it was."
+    },
+    "v1Event": {
+      "type": "object",
+      "properties": {
+        "sequence": {
+          "type": "string",
+          "format": "uint64",
+          "description": "Monotonically increasing per client_id, gapless. The client persists the\nhighest value it has handled and sends it back as last_sequence on\nreconnect."
+        },
+        "alert": {
+          "$ref": "#/definitions/v1Alert"
+        },
+        "alertRevoked": {
+          "$ref": "#/definitions/v1AlertRevoked"
+        },
+        "heartbeat": {
+          "$ref": "#/definitions/v1Heartbeat",
+          "description": "Sent every 25s so the client can distinguish a quiet server from a\nhalf-open connection. Carries no meaning beyond its arrival."
+        },
+        "machineConfigChanged": {
+          "$ref": "#/definitions/v1MachineConfigChanged",
+          "description": "A configuration change finished applying, failed, or was made by\nsomebody else. The form refreshes its current values from this rather\nthan polling."
+        }
+      }
+    },
+    "v1GetClientInfoResponse": {
+      "type": "object",
+      "properties": {
+        "clientId": {
+          "type": "string"
+        },
+        "displayName": {
+          "type": "string"
+        },
+        "minClientVersion": {
+          "type": "string",
+          "description": "Semver. The extension is distributed as a .vsix passed around by hand, so\nit never auto-updates; this is how an out-of-date install is told to\nupdate rather than failing in confusing ways."
+        },
+        "serverTime": {
+          "type": "string",
+          "format": "date-time"
+        }
+      }
+    },
+    "v1GetMachineConfigResponse": {
+      "type": "object",
+      "properties": {
+        "version": {
+          "type": "string",
+          "description": "Opaque version of the machine's configuration state. Echoed back as\nApplyMachineConfigRequest.expected_version; the server rejects a mismatch.\nThis is what stops a form left open for an hour from reverting a change\nsomebody made in the meantime."
+        },
+        "gpuTypes": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "$ref": "#/definitions/v1GpuType"
+          },
+          "description": "Rendered in the order given; the client does not re-sort. Must include the\nreserved \"none\" id. The client synthesises it when absent, and logs a\nwarning: a form with no way to say \"no GPU\" is broken."
+        },
+        "current": {
+          "$ref": "#/definitions/v1ResourceSpec",
+          "description": "The machine's current configuration. This is what the form is pre-filled\nwith and what \"changed\" is measured against. Absent only for a machine\nthat has never been configured."
+        },
+        "limits": {
+          "$ref": "#/definitions/v1ResourceLimits",
+          "description": "Absent means the documented defaults apply: 1-256 cores, 1-2048 GB RAM,\n1-2048 GB SSD, 1-8 GPUs. Sending them explicitly means a bound can change\nwithout shipping a new .vsix."
+        },
+        "pendingChange": {
+          "$ref": "#/definitions/v1MachineChange",
+          "description": "Set while a change is applying. The client renders the form read-only\nrather than letting the user queue a second change on top of the first."
+        }
+      }
+    },
+    "v1GpuType": {
+      "type": "object",
+      "properties": {
+        "gpuTypeId": {
+          "type": "string",
+          "description": "\"none\" is reserved and means no GPU."
+        },
+        "label": {
+          "type": "string"
+        },
+        "maxCount": {
+          "type": "integer",
+          "format": "int64",
+          "description": "Upper bound on gpu_count for this type. Node topologies differ per\naccelerator, so this is per-type rather than a single global maximum. The\nclient clamps to min(max_count, limits.gpu_count_max)."
+        }
+      }
+    },
+    "v1Heartbeat": {
+      "type": "object",
+      "properties": {
+        "serverTime": {
+          "type": "string",
+          "format": "date-time"
+        }
+      }
+    },
+    "v1ListPendingAlertsResponse": {
+      "type": "object",
+      "properties": {
+        "alerts": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "$ref": "#/definitions/v1Alert"
+          }
+        },
+        "sequence": {
+          "type": "string",
+          "format": "uint64",
+          "description": "Highest sequence represented by this response, so a client that fell back\nto polling can resume streaming without a gap."
+        }
+      }
+    },
+    "v1MachineChange": {
+      "type": "object",
+      "properties": {
+        "changeId": {
+          "type": "string"
+        },
+        "status": {
+          "$ref": "#/definitions/v1ChangeStatus"
+        },
+        "spec": {
+          "$ref": "#/definitions/v1ResourceSpec",
+          "description": "The configuration being applied."
+        },
+        "startedAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "cancellableUntil": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Deadline for CancelMachineChange. Absent when the change was never\ncancellable or the window has closed. The client renders a countdown from\nthis, corrected for clock skew against the server time it tracks from\nheartbeats — and treats its own countdown as advisory, since the server\nis the authority on whether a cancel arrived in time."
+        },
+        "failureReason": {
+          "type": "string",
+          "description": "Set when status is FAILED. Shown to the user verbatim, so it should read\nas an explanation rather than a stack trace.\n\nA failed or cancelled change leaves the machine on its previous\nconfiguration — the server reverts, and there is no partial state for the\nclient to represent or the user to untangle."
+        },
+        "url": {
+          "type": "string",
+          "description": "Deep link to the change record, offered as an \"Open\" button on the\ncompletion notification. Optional."
+        }
+      }
+    },
+    "v1MachineConfigChanged": {
+      "type": "object",
+      "properties": {
+        "current": {
+          "$ref": "#/definitions/v1ResourceSpec",
+          "description": "The configuration now in effect."
+        },
+        "version": {
+          "type": "string",
+          "description": "New config version, to be used as expected_version on the next apply."
+        },
+        "change": {
+          "$ref": "#/definitions/v1MachineChange",
+          "description": "The change that produced this state. Absent when the change originated\noutside this client, which is exactly when the client most needs to know\nits form is stale."
+        }
+      }
+    },
+    "v1PreviewMachineConfigRequest": {
+      "type": "object",
+      "properties": {
+        "clientId": {
+          "type": "string"
+        },
+        "spec": {
+          "$ref": "#/definitions/v1ResourceSpec",
+          "description": "The complete desired configuration, exactly as it would be sent to\nApplyMachineConfig."
+        },
+        "expectedVersion": {
+          "type": "string"
+        }
+      }
+    },
+    "v1PreviewMachineConfigResponse": {
+      "type": "object",
+      "properties": {
+        "hasChanges": {
+          "type": "boolean",
+          "description": "False when the spec is identical to the current configuration. The client\ndisables Apply in that state anyway, so this is a backstop."
+        },
+        "requiresRestart": {
+          "type": "boolean",
+          "description": "True when applying this particular spec restarts the machine. Not a\nproperty of the machine: growing a disk may be free where swapping an\naccelerator is not."
+        },
+        "effects": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "$ref": "#/definitions/v1ChangeEffect"
+          },
+          "description": "One per field the user changed, so the confirmation dialog can name which\nspecific edit forces the restart rather than warning about the change as\nan undifferentiated whole."
+        },
+        "warning": {
+          "type": "string",
+          "title": "Optional extra sentence for the dialog, e.g. \"Running jobs will be\nterminated.\""
+        },
+        "cancellationWindowSeconds": {
+          "type": "integer",
+          "format": "int64",
+          "description": "How long the change will be cancellable once started, so the dialog can\nset expectations before the user commits. Zero means not cancellable."
+        }
+      }
+    },
+    "v1ResourceLimits": {
+      "type": "object",
+      "properties": {
+        "gpuCountMin": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "gpuCountMax": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "cpuCoresMin": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "cpuCoresMax": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "ramGbMin": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "ramGbMax": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "ssdGbMin": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "ssdGbMax": {
+          "type": "integer",
+          "format": "int64"
+        }
+      }
+    },
+    "v1ResourceSpec": {
+      "type": "object",
+      "properties": {
+        "gpuTypeId": {
+          "type": "string"
+        },
+        "gpuCount": {
+          "type": "integer",
+          "format": "int64",
+          "description": "Absent when gpu_type_id is \"none\" — not zero. A request that sets both is\nrejected with INVALID_ARGUMENT rather than silently ignoring the field, so\na bug in the client's conditional logic surfaces immediately instead of\nquietly provisioning the wrong thing."
+        },
+        "cpuCores": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "ramGb": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "ssdGb": {
+          "type": "integer",
+          "format": "int64"
+        }
+      }
+    },
+    "v1RespondToAlertResponse": {
+      "type": "object",
+      "properties": {
+        "alertId": {
+          "type": "string"
+        },
+        "recorded": {
+          "type": "boolean",
+          "description": "True when this call recorded the answer, false when it matched an answer\nalready on file. Lets the client tell a successful retry from a genuine\ndouble-submit without treating either as an error."
+        }
+      }
+    },
+    "v1Severity": {
+      "type": "string",
+      "enum": [
+        "SEVERITY_UNSPECIFIED",
+        "SEVERITY_INFO",
+        "SEVERITY_WARNING",
+        "SEVERITY_ERROR"
+      ],
+      "default": "SEVERITY_UNSPECIFIED"
+    }
+  }
+}

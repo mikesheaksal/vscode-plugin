@@ -1,5 +1,4 @@
 node_modules/
 out/
-gen/
 *.vsix
 .vscode-test/

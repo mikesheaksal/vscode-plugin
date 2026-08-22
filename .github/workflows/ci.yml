@@ -1,0 +1,55 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  extension:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.24'
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm run lint
+      # Unit tests include the suite that runs against the Go mock behind a
+      # real grpc-gateway, which is why Go is set up here.
+      - run: npm test
+      - run: npm run build
+      - run: go vet ./...
+
+  contract:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # buf breaking compares against main, which needs its history.
+          fetch-depth: 0
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.24'
+      - run: go install github.com/bufbuild/buf/cmd/buf@v1.47.2
+      - run: buf lint
+        working-directory: proto
+      - name: buf breaking against main
+        run: make breaking
+
+  integration:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+      - run: npm ci
+      # The extension host needs a display, and downloads VS Code on first run.
+      - run: xvfb-run -a npm run test:integration

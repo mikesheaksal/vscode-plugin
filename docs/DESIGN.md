@@ -204,6 +204,11 @@ Consequences, all of which the client handles:
 - **Buffering is still the risk it always was.** The Go handler must call `Flush()` per
   message, and any proxy in front needs `X-Accel-Buffering: no` and no response
   compression, or events arrive in clumps. This is what the long-poll fallback exists for.
+- **The server must send a heartbeat immediately on stream open.** grpc-gateway does not
+  flush response headers until the first message, so a stream that opens with nothing to
+  say leaves the client's `fetch()` unresolved — indistinguishable from a server that
+  never answered — until the first 25s tick. Found by the Phase 3 integration tests, which
+  hung on exactly this; the mock now sends one and the real backend must too.
 
 ### 5.2 JSON field naming
 
@@ -257,19 +262,44 @@ client map a violation to the right input without a bespoke error vocabulary. **
 cross-field limits arrive later, they need no client change** — a new violation on
 `spec.cpu_cores` renders next to the CPU field automatically.
 
-### 5.5 Code generation
+### 5.5 What the mock confirmed
 
-`buf generate` (see [`proto/buf.gen.yaml`](../proto/buf.gen.yaml)) produces, from the one
-file: Go message and gRPC stubs, the grpc-gateway mux, an OpenAPI v2 document, and
-**TypeScript types for the extension**. The client speaks JSON to the gateway rather than
+Phase 3 put a Go mock behind a real grpc-gateway and pointed the client at it, so the
+claims in this section are now observations rather than expectations:
+
+```
+{"result":{"sequence":"1","alert":{"alertId":"alt_1","severity":"SEVERITY_WARNING", ...}}}
+```
+
+- The stream envelope is `{"result": …}` per line, with no `data:` framing.
+- `sequence` is a **JSON string**, as the uint64 rule predicts.
+- Field names are lowerCamelCase; enums are full string names.
+- `EmitUnpopulated: false` keeps an unset `gpu_count` genuinely absent, and also means
+  `requiresRestart` is **omitted rather than `false`** — the client must treat absent as
+  false, which the generated types do.
+- `INVALID_ARGUMENT` carries `google.rpc.BadRequest` with `fieldViolations[].field` set to
+  the proto path, so `spec.ram_gb` maps straight onto the RAM input.
+
+### 5.6 Code generation
+
+`make generate` produces, from the one file: Go message and gRPC stubs, the grpc-gateway
+mux, an OpenAPI v2 document, and **TypeScript types for the extension**. Two templates,
+because the Go side must not regenerate the googleapis imports it gets from published
+modules while the TypeScript side has no published equivalent to depend on. The client speaks JSON to the gateway rather than
 gRPC, but generating its types from the same proto means a field rename breaks the
 TypeScript build instead of a user's form. That is most of the payoff of doing this
 proto-first, and it costs one plugin entry.
 
-`buf breaking` in CI against the main branch is worth adding on day one, because the
-.vsix distribution model (Phase 9) means old clients stay in the field indefinitely.
+`buf breaking` in CI against the main branch runs from day one, because the .vsix
+distribution model (Phase 9) means old clients stay in the field indefinitely.
 
-### 5.6 If grpc-gateway is dropped
+Plugins are **local, not remote**, and the googleapis imports are **vendored** under
+`proto/third_party`: the buf.build registry is not reachable from every environment this
+repo builds in, and a contract that cannot be regenerated in CI is not much of a contract.
+`make tools` installs everything. Generated output is committed, so building the extension
+needs only npm and building the mock needs only Go.
+
+### 5.7 If grpc-gateway is dropped
 
 Nothing above except §5.1–5.3 depends on it. The six operations, their payloads, the
 persistence and revocation semantics, and every client behaviour in §7–§9 are transport

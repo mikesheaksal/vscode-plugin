@@ -15,6 +15,42 @@ The backend is Go (gRPC + grpc-gateway); the extension talks JSON to the gateway
   `buf generate` produces Go stubs, the gateway, OpenAPI, and the extension's TypeScript
   types from it.
 
+## The mock backend
+
+A Go implementation of the service behind a real grpc-gateway, so the extension
+develops against the same JSON projection the backend will serve.
+
+```bash
+make mock                     # http://127.0.0.1:8080, token "dev-token", client "dev-9"
+
+# push an alert to every listening client
+curl -X POST localhost:8080/admin/alerts -d '{
+  "severity":"warning","title":"Approval needed","message":"build #4821 is waiting.",
+  "buttons":[{"id":"approve","label":"Approve"},{"id":"reject","label":"Reject"}]}'
+
+# withdraw one
+curl -X POST localhost:8080/admin/alerts/alt_1/revoke?reason=withdrawn
+```
+
+`--apply-delay` controls how long a configuration change stays `APPLYING`, so the
+client's applying state and cancellation window are observable. The `/admin`
+endpoints are the mock's own, not part of the contract.
+
+## Working on the contract
+
+```bash
+make tools       # buf, the protoc plugins, npm dependencies
+make generate    # Go + gateway + OpenAPI + TypeScript, from the one proto
+make lint        # buf lint
+make breaking    # buf breaking against main
+```
+
+Generated output is committed, so building the extension needs only npm and
+building the mock needs only Go. The googleapis imports are vendored under
+`proto/third_party` and the protoc plugins are local rather than remote,
+because the buf.build registry is not reachable from every environment this
+repo builds in.
+
 ## Development
 
 ```bash
@@ -28,9 +64,16 @@ bell icon appears in the Activity Bar and opens a sidebar holding the **Machine*
 and **Alerts** views.
 
 Unit tests (`npm test`, vitest) run in plain Node and cover code that does not
-import `vscode` — plus `src/manifest.test.ts`, which checks the half of the
-extension the compiler never sees: menu commands that exist, welcome-view links
-that resolve, the declared icon being present.
+import `vscode`:
+
+- `src/core/`, `src/api/errors.ts` — pure logic, no I/O.
+- `src/manifest.test.ts` — the half of the extension the compiler never sees:
+  menu commands that exist, welcome-view links that resolve, the declared icon
+  being present.
+- `src/api/client.mocksrv.test.ts` — the API client against the **real Go mock
+  behind a real gateway**. It builds and starts the mock itself, and skips
+  cleanly when Go is not installed. These are the tests that caught the wire
+  format assumptions a hand-written fetch stub would have agreed with.
 
 Integration tests (`npm run test:integration`, files named `*.itest.ts`) run
 inside a real VS Code via `@vscode/test-cli`: the extension activates, both
