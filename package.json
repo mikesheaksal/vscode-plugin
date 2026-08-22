@@ -110,6 +110,12 @@
         "title": "Answer (second option)",
         "category": "Acme Alerts",
         "icon": "$(close)"
+      },
+      {
+        "command": "acmeAlerts.openInEditor",
+        "title": "Open in Editor",
+        "category": "Acme Alerts",
+        "icon": "$(link-external)"
       }
     ],
     "menus": {
@@ -117,7 +123,12 @@
         {
           "command": "acmeAlerts.refresh",
           "when": "view == acmeAlerts.pending || view == acmeAlerts.machine",
-          "group": "navigation"
+          "group": "navigation@2"
+        },
+        {
+          "command": "acmeAlerts.openInEditor",
+          "when": "view == acmeAlerts.machine",
+          "group": "navigation@1"
         }
       ],
       "commandPalette": [
@@ -184,10 +195,10 @@
   "scripts": {
     "build": "node esbuild.mjs",
     "watch": "node esbuild.mjs --watch",
-    "typecheck": "tsc --noEmit",
+    "typecheck": "tsc --noEmit && tsc --noEmit -p tsconfig.webview.json",
     "lint": "eslint src",
     "test": "vitest run",
-    "check": "npm run typecheck && npm run lint && npm run test && npm run build",
+    "check": "npm run typecheck && npm run lint && npm run build && npm run test",
     "vscode:prepublish": "node esbuild.mjs --production",
     "pretest:integration": "npm run build && tsc -p tsconfig.test.json",
     "test:integration": "vscode-test",

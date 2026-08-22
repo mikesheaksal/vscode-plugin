@@ -81,6 +81,14 @@ views resolve, and `ConfigService` is exercised against the genuine settings
 and filesystem APIs. They download VS Code on first run, so they need network
 access to `update.code.visualstudio.com`.
 
+### The webview
+
+`src/webview/form.ts` is bundled separately into `media/form.js`, and shares
+`src/core/machineForm.ts` with the extension so the renderer and the validator
+cannot drift apart. It is typechecked against DOM types via
+`tsconfig.webview.json`; the extension deliberately is not, so `document` in
+extension code is a compile error rather than a runtime crash.
+
 ### Configuring a local run
 
 The extension needs three things before it reports `ready`:

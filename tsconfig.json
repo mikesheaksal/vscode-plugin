@@ -18,6 +18,7 @@
     "resolveJsonModule": true,
     "forceConsistentCasingInFileNames": true
   },
+  // src/webview is typechecked separately, against DOM rather than Node.
   "include": ["src/**/*.ts", "esbuild.mjs"],
-  "exclude": ["node_modules", "out"]
+  "exclude": ["node_modules", "out", "src/webview"],
 }

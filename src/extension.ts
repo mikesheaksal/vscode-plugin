@@ -3,6 +3,7 @@ import { AlertService } from './alerts/alertService';
 import { ApiClient } from './api/client';
 import { ConfigService } from './config';
 import { Logger } from './log';
+import { MachineConfigService } from './machine/machineConfig';
 import { StateController } from './state';
 import { AlertsTreeProvider, PendingAlertItem } from './views/alertsTree';
 import { MachineViewProvider } from './views/machineView';
@@ -20,15 +21,6 @@ export function activate(context: vscode.ExtensionContext): void {
 
   const alertsTree = new AlertsTreeProvider();
   context.subscriptions.push(alertsTree, alertsTree.register());
-
-  const machine = new MachineViewProvider(context.extensionUri, log);
-  context.subscriptions.push(
-    vscode.window.registerWebviewViewProvider(MachineViewProvider.viewType, machine, {
-      // See MachineViewProvider: draft persistence replaces retaining the
-      // webview, so we let VS Code reclaim it when hidden.
-      webviewOptions: { retainContextWhenHidden: false },
-    }),
-  );
 
   /**
    * Builds a client from whatever credentials currently resolve, or undefined
@@ -48,11 +40,29 @@ export function activate(context: vscode.ExtensionContext): void {
     });
   };
 
+  const machineConfig = new MachineConfigService(context.globalState, log, clientFor);
+  const machine = new MachineViewProvider(
+    context.extensionUri,
+    log,
+    machineConfig,
+    context.workspaceState,
+  );
+  context.subscriptions.push(
+    machineConfig,
+    machine,
+    vscode.window.registerWebviewViewProvider(MachineViewProvider.viewType, machine, {
+      // See MachineViewProvider: draft persistence replaces retaining the
+      // webview, so we let VS Code reclaim it when hidden.
+      webviewOptions: { retainContextWhenHidden: false },
+    }),
+  );
+
   const alerts = new AlertService(context.globalState, log, alertsTree, config, clientFor);
   context.subscriptions.push(alerts);
 
   context.subscriptions.push(
     vscode.commands.registerCommand('acmeAlerts.showMachine', () => machine.reveal()),
+    vscode.commands.registerCommand('acmeAlerts.openInEditor', () => machine.openInEditor()),
     vscode.commands.registerCommand('acmeAlerts.showLog', () => log.show()),
     vscode.commands.registerCommand('acmeAlerts.openSettings', () =>
       vscode.commands.executeCommand('workbench.action.openSettings', '@ext:acme.acme-alerts'),

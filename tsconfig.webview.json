@@ -1,0 +1,16 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    // The webview runs in a browser context, so it gets DOM types. The
+    // extension deliberately does not: `document` there is a bug, and keeping
+    // the libs separate is what makes it a compile error rather than a crash.
+    "lib": ["ES2022", "DOM"],
+    "types": []
+  },
+  // Only the modules the webview genuinely shares. Listing them rather than
+  // globbing src/core keeps the shared surface deliberate: anything added here
+  // must work in a browser with no Node types.
+  "include": ["src/webview/**/*.ts", "src/core/machineForm.ts"],
+  // The base config excludes src/webview; this project is exactly that folder.
+  "exclude": ["node_modules", "out"]
+}

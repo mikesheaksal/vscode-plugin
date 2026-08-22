@@ -46,6 +46,15 @@ describe('manifest', () => {
     }
   });
 
+  it('ships the webview assets the machine form loads', () => {
+    // Referenced from HTML rather than imported, so nothing else would catch a
+    // missing file until the view rendered blank at runtime. form.js is built
+    // by esbuild, which is why `npm run check` builds before it tests.
+    for (const asset of ['media/form.css', 'media/form.js']) {
+      expect(existsSync(asset), `${asset} is missing`).toBe(true);
+    }
+  });
+
   it('ships the Activity Bar icon it declares', () => {
     for (const container of manifest.contributes.viewsContainers.activitybar) {
       expect(existsSync(container.icon), `${container.icon} is missing`).toBe(true);

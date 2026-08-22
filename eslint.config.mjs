@@ -8,6 +8,7 @@ export default [
   js.configs.recommended,
   {
     files: ['src/**/*.ts'],
+    ignores: ['src/webview/**'],
     languageOptions: {
       parser: tsparser,
       parserOptions: { project: './tsconfig.json' },
@@ -16,6 +17,22 @@ export default [
     rules: {
       ...tseslint.configs.recommended.rules,
       '@typescript-eslint/no-floating-promises': 'error',
+      '@typescript-eslint/no-unused-vars': ['error', { argsIgnorePattern: '^_' }],
+      eqeqeq: ['error', 'always'],
+      'no-undef': 'off',
+    },
+  },
+  // The webview is typechecked against DOM rather than Node, so it needs its
+  // own project reference here too.
+  {
+    files: ['src/webview/**/*.ts'],
+    languageOptions: {
+      parser: tsparser,
+      parserOptions: { project: './tsconfig.webview.json' },
+    },
+    plugins: { '@typescript-eslint': tseslint },
+    rules: {
+      ...tseslint.configs.recommended.rules,
       '@typescript-eslint/no-unused-vars': ['error', { argsIgnorePattern: '^_' }],
       eqeqeq: ['error', 'always'],
       'no-undef': 'off',
