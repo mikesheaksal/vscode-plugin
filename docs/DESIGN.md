@@ -543,22 +543,39 @@ than a rewrite.
 | Field | Control | Range | Notes |
 |---|---|---|---|
 | GPU Type | `<select>` | options from `GetMachineConfig` | Options are dynamic; the field itself is not |
-| Number of GPUs | `<select>` 1…N | 1–`maxCount` (≤8) | Hidden when GPU Type is `none` |
-| CPU cores | text, `inputmode="numeric"` | 1–256 | |
-| RAM (GB) | text, `inputmode="numeric"` | 1–2048 | |
-| SSD (GB) | text, `inputmode="numeric"` | 1–2048 | |
+| Number of GPUs | slider + readout | 1–`maxCount` (≤8) | Hidden when GPU Type is `none` |
+| CPU cores | slider + text box | 1–256 | |
+| RAM (GB) | slider + text box | 1–2048 | |
+| SSD (GB) | slider + text box | 1–2048 | |
 
-Two control choices worth justifying:
+Three control choices worth justifying:
 
-- **GPU count is a `<select>`, not a number input.** The range is at most eight discrete
-  values, it is regenerated whenever GPU Type changes (because `maxCount` is per type), and
-  a dropdown makes an out-of-range value unrepresentable rather than merely rejected.
-- **The other three are `type="text"` with `inputmode="numeric"`, not `type="number"`.**
+- **The numeric fields pair a slider with a text box, bound to the same value.** Neither
+  alone is sufficient. A linear 1–2048 slider in a ~300px sidebar is roughly seven values
+  per pixel, so it cannot land on an exact number; a bare text box makes exploring the
+  range tedious. The slider reaches a shape quickly, the box says exactly 300 rather
+  than 256.
+- **Over a wide range the slider steps through a curated scale**, not every integer:
+  powers of two plus their halfway points above 16, always including both bounds — about
+  twenty positions for 1–2048, rendered as tick marks. Any integer is still accepted
+  through the text box, so this constrains the *slider* without constraining the *value*.
+  A typed value that is off-scale parks the handle at the nearest position and is left
+  alone.
+- **GPU count is a slider with a readout and no text box.** At most eight discrete values
+  fit a slider exactly, so a box would add nothing — and the slider makes an out-of-range
+  count unrepresentable rather than merely rejected, which is what the earlier dropdown
+  was for.
+- **The text boxes are `type="text"` with `inputmode="numeric"`, not `type="number"`.**
   `type="number"` has two properties that hurt here: its `.value` is the empty string when
   the user types something unparseable, so we cannot echo back what they actually typed;
   and its scroll-wheel behaviour silently changes the value when a user scrolls the
   sidebar with the cursor over the field. Reading raw text and validating it ourselves
-  avoids both. `inputmode="numeric"` still gets the numeric keypad where that applies.
+  avoids both.
+
+The slider commits on release rather than on every pixel, so validation and the
+Apply/No-changes state do not flicker through a drag. Typing updates the Apply button
+directly rather than through a re-render, since rebuilding the inputs would take the
+caret away mid-keystroke.
 
 ### 8.3 Conditional logic for GPU count
 

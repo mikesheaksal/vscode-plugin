@@ -14,6 +14,8 @@ import {
   draftFromSpec,
   isChanged,
   maxCountFor,
+  nearestScaleIndex,
+  sliderScale,
   validate,
   type FieldErrors,
   type FormDraft,
@@ -55,6 +57,8 @@ let serverErrors: FieldErrors = {};
 let touched = new Set<string>();
 let busy = false;
 let readOnly = false;
+/** Kept so typing can update the buttons without rebuilding the DOM under the cursor. */
+let applyButton: HTMLButtonElement | undefined;
 
 window.addEventListener('message', (event: MessageEvent<HostMessage>) => {
   const message = event.data;
@@ -147,11 +151,16 @@ function render(formError?: string): void {
   if (draft.gpuTypeId !== '' && draft.gpuTypeId !== NONE_GPU) {
     const max = maxCountFor(draft.gpuTypeId, options, limits);
     form.append(
-      selectField({
+      sliderField({
         key: FIELD.gpuCount,
         label: 'Number of GPUs',
         value: draft.gpuCount,
-        choices: countChoices(max),
+        min: limits?.gpuCountMin ?? 1,
+        max,
+        // Eight discrete values fit a slider exactly, so there is nothing a
+        // text box would add — and the slider makes an out-of-range value
+        // unrepresentable rather than merely rejected.
+        withInput: false,
         error: visible[FIELD.gpuCount],
         onChange: (value) => {
           draft = { ...draft, gpuCount: value };
@@ -161,15 +170,40 @@ function render(formError?: string): void {
     );
   }
 
+  const bounds = limits ?? undefined;
   form.append(
-    numberField(FIELD.cpuCores, 'CPU cores', draft.cpuCores, visible[FIELD.cpuCores], (value) => {
-      draft = { ...draft, cpuCores: value };
+    sliderField({
+      key: FIELD.cpuCores,
+      label: 'CPU cores',
+      value: draft.cpuCores,
+      min: bounds?.cpuCoresMin ?? 1,
+      max: bounds?.cpuCoresMax ?? 256,
+      error: visible[FIELD.cpuCores],
+      onChange: (value) => {
+        draft = { ...draft, cpuCores: value };
+      },
     }),
-    numberField(FIELD.ramGb, 'RAM (GB)', draft.ramGb, visible[FIELD.ramGb], (value) => {
-      draft = { ...draft, ramGb: value };
+    sliderField({
+      key: FIELD.ramGb,
+      label: 'RAM (GB)',
+      value: draft.ramGb,
+      min: bounds?.ramGbMin ?? 1,
+      max: bounds?.ramGbMax ?? 2048,
+      error: visible[FIELD.ramGb],
+      onChange: (value) => {
+        draft = { ...draft, ramGb: value };
+      },
     }),
-    numberField(FIELD.ssdGb, 'SSD (GB)', draft.ssdGb, visible[FIELD.ssdGb], (value) => {
-      draft = { ...draft, ssdGb: value };
+    sliderField({
+      key: FIELD.ssdGb,
+      label: 'SSD (GB)',
+      value: draft.ssdGb,
+      min: bounds?.ssdGbMin ?? 1,
+      max: bounds?.ssdGbMax ?? 2048,
+      error: visible[FIELD.ssdGb],
+      onChange: (value) => {
+        draft = { ...draft, ssdGb: value };
+      },
     }),
   );
 
@@ -178,13 +212,10 @@ function render(formError?: string): void {
   }
 
   const actions = el('div', 'actions');
-  const apply = el(
-    'button',
-    'primary',
-    readOnly ? 'Applying changes…' : changed ? 'Apply changes' : 'No changes',
-  ) as HTMLButtonElement;
+  const apply = el('button', 'primary', '') as HTMLButtonElement;
   apply.type = 'submit';
-  apply.disabled = busy || readOnly || !changed || spec === undefined;
+  applyButton = apply;
+  syncActions();
   actions.append(apply);
 
   if (changed && !readOnly) {
@@ -201,6 +232,27 @@ function render(formError?: string): void {
   }
   form.append(actions);
   root.append(form);
+}
+
+/**
+ * Refreshes the Apply button from the current draft without re-rendering.
+ *
+ * A full render replaces every input, which would take the focus and caret
+ * away mid-keystroke. Only the button actually depends on each character, so
+ * only the button is updated.
+ */
+function syncActions(): void {
+  if (!applyButton) {
+    return;
+  }
+  const changed = isChanged(draft, current);
+  const { spec } = validate(draft, options, limits);
+  applyButton.textContent = readOnly
+    ? 'Applying changes…'
+    : changed
+      ? 'Apply changes'
+      : 'No changes';
+  applyButton.disabled = busy || readOnly || !changed || spec === undefined;
 }
 
 /**
@@ -294,36 +346,109 @@ function selectField(config: {
 }
 
 /**
- * Text with a numeric inputmode rather than `type="number"`.
+ * A slider paired with a text box, both bound to the same draft value.
  *
- * `type="number"` reports an empty value for unparseable input, so the user
- * cannot be shown what they typed, and its scroll-wheel behaviour silently
- * changes the value when the sidebar is scrolled with the cursor over it.
+ * The slider is for reaching a shape quickly; the text box is for saying
+ * exactly 300 rather than 256. Neither alone is enough: a linear 1..2048
+ * slider in a narrow sidebar is about seven values per pixel, and a bare text
+ * box makes exploring the range tedious.
+ *
+ * The text box is `type="text"` with a numeric inputmode rather than
+ * `type="number"`, which reports an empty value for unparseable input — so the
+ * user cannot be shown what they typed — and silently changes on scroll.
  */
-function numberField(
-  key: string,
-  label: string,
-  value: string,
-  error: string | undefined,
-  onInput: (value: string) => void,
-): HTMLElement {
+function sliderField(config: {
+  key: string;
+  label: string;
+  value: string;
+  min: number;
+  max: number;
+  withInput?: boolean;
+  error?: string | undefined;
+  onChange: (value: string) => void;
+}): HTMLElement {
   const wrapper = el('div', 'field');
-  wrapper.append(labelFor(key, label));
+  const header = el('div', 'field-header');
+  header.append(labelFor(config.key, config.label));
 
-  const input = document.createElement('input');
-  input.type = 'text';
-  input.inputMode = 'numeric';
-  input.autocomplete = 'off';
-  input.id = key;
-  input.value = value;
-  input.disabled = readOnly || busy;
-  input.addEventListener('input', () => {
-    onInput(input.value);
+  const scale = sliderScale(config.min, config.max);
+  const parsed = asInt(config.value);
+  const disabled = readOnly || busy;
+
+  const slider = document.createElement('input');
+  slider.type = 'range';
+  slider.className = 'slider';
+  slider.min = '0';
+  slider.max = String(Math.max(scale.length - 1, 0));
+  slider.step = '1';
+  // An off-scale value still positions the handle sensibly without being
+  // rewritten: typing 300 leaves 300 alone and parks the handle near 256.
+  slider.value = String(nearestScaleIndex(scale, parsed ?? config.min));
+  slider.disabled = disabled;
+  slider.setAttribute('aria-label', config.label);
+  if (scale.length > 2 && scale.length <= 32) {
+    slider.setAttribute('list', `${config.key}-ticks`);
+  }
+
+  const readout = el('output', 'readout', parsed === undefined ? '—' : String(parsed));
+  let valueInput: HTMLInputElement | undefined;
+
+  if (config.withInput === false) {
+    header.append(readout);
+  } else {
+    const input = document.createElement('input');
+    input.type = 'text';
+    input.inputMode = 'numeric';
+    input.autocomplete = 'off';
+    input.className = 'value-input';
+    input.id = config.key;
+    input.value = config.value;
+    input.disabled = disabled;
+    input.setAttribute('aria-label', config.label);
+    valueInput = input;
+    input.addEventListener('input', () => {
+      config.onChange(input.value);
+      const typed = asInt(input.value);
+      if (typed !== undefined) {
+        slider.value = String(nearestScaleIndex(scale, typed));
+      }
+      syncActions();
+      persist();
+    });
+    input.addEventListener('blur', () => touch(config.key));
+    header.append(input);
+  }
+
+  slider.addEventListener('input', () => {
+    const picked = scale[Number(slider.value)] ?? config.min;
+    readout.textContent = String(picked);
+    if (valueInput) {
+      valueInput.value = String(picked);
+    }
+    config.onChange(String(picked));
+    syncActions();
     persist();
   });
-  input.addEventListener('blur', () => touch(key));
-  wrapper.append(input);
-  appendError(wrapper, error);
+  // Committing on release rather than on every pixel keeps validation and the
+  // Apply/No-changes state from flickering during a drag.
+  slider.addEventListener('change', () => touch(config.key));
+
+  wrapper.append(header, slider);
+
+  if (scale.length > 2 && scale.length <= 32) {
+    const ticks = document.createElement('datalist');
+    ticks.id = `${config.key}-ticks`;
+    for (const [index] of scale.entries()) {
+      const option = document.createElement('option');
+      option.value = String(index);
+      ticks.append(option);
+    }
+    wrapper.append(ticks);
+  }
+
+  const range = el('p', 'muted range-hint', `${config.min}–${config.max}`);
+  wrapper.append(range);
+  appendError(wrapper, config.error);
   return wrapper;
 }
 
@@ -338,13 +463,6 @@ function appendError(wrapper: HTMLElement, error: string | undefined): void {
   if (error) {
     wrapper.append(el('p', 'error-text', error));
   }
-}
-
-function countChoices(max: number): Array<{ value: string; label: string }> {
-  return Array.from({ length: max }, (_, index) => ({
-    value: String(index + 1),
-    label: String(index + 1),
-  }));
 }
 
 function withMissing(

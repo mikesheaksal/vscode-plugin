@@ -1,6 +1,8 @@
 import { describe, expect, it } from 'vitest';
 import {
   DEFAULT_LIMITS,
+  nearestScaleIndex,
+  sliderScale,
   EMPTY_DRAFT,
   FIELD,
   NONE_GPU,
@@ -200,5 +202,70 @@ describe('ensureNoneOption', () => {
     const result = ensureNoneOption([OPTIONS[1]!]);
     expect(result.synthesized).toBe(true);
     expect(result.options[0]?.gpuTypeId).toBe(NONE_GPU);
+  });
+});
+
+describe('sliderScale', () => {
+  it('gives every value for a small range, where a slider is exact', () => {
+    expect(sliderScale(1, 8)).toEqual([1, 2, 3, 4, 5, 6, 7, 8]);
+  });
+
+  it('steps through round values over a wide range', () => {
+    // 2048 positions in a narrow sidebar is about seven values per pixel, so
+    // the slider offers the shapes people actually pick.
+    const scale = sliderScale(1, 2048);
+    expect(scale[0]).toBe(1);
+    expect(scale.at(-1)).toBe(2048);
+    expect(scale).toContain(256);
+    expect(scale).toContain(512);
+    expect(scale).toContain(1024);
+    // Small enough to be draggable, large enough to be useful.
+    expect(scale.length).toBeLessThan(30);
+  });
+
+  it('keeps the low end clean and the high end navigable', () => {
+    const scale = sliderScale(1, 2048);
+    expect(scale).not.toContain(3);
+    expect(scale).not.toContain(6);
+    expect(scale).toContain(24);
+    expect(scale).toContain(1536);
+  });
+
+  it('always includes both bounds, even when they are not round', () => {
+    const scale = sliderScale(3, 250);
+    expect(scale[0]).toBe(3);
+    expect(scale.at(-1)).toBe(250);
+    expect(scale.every((value) => value >= 3 && value <= 250)).toBe(true);
+  });
+
+  it('is ascending and free of duplicates', () => {
+    const scale = sliderScale(1, 256);
+    expect([...scale].sort((a, b) => a - b)).toEqual(scale);
+    expect(new Set(scale).size).toBe(scale.length);
+  });
+
+  it('degenerates safely when there is only one possible value', () => {
+    expect(sliderScale(4, 4)).toEqual([4]);
+    expect(sliderScale(9, 2)).toEqual([9]);
+  });
+});
+
+describe('nearestScaleIndex', () => {
+  const scale = [1, 2, 4, 8, 16];
+
+  it('finds an exact position', () => {
+    expect(nearestScaleIndex(scale, 8)).toBe(3);
+  });
+
+  it('finds the closest position for a value not on the scale', () => {
+    // A typed value of 300 still puts the handle somewhere sensible without
+    // changing the value itself.
+    expect(nearestScaleIndex(scale, 7)).toBe(3);
+    expect(nearestScaleIndex(scale, 3)).toBe(1);
+  });
+
+  it('clamps to the ends for values outside the scale', () => {
+    expect(nearestScaleIndex(scale, 0)).toBe(0);
+    expect(nearestScaleIndex(scale, 9999)).toBe(4);
   });
 });

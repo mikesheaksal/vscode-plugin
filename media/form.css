@@ -117,3 +117,48 @@ button:disabled {
   margin: 0;
   color: var(--vscode-descriptionForeground);
 }
+
+/* A slider paired with the value it sets. The slider reaches a shape quickly;
+   the text box beside it says exactly 300 rather than 256. */
+.field-header {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.value-input {
+  width: 5.5em;
+  flex: 0 0 auto;
+  text-align: right;
+}
+
+.readout {
+  font-variant-numeric: tabular-nums;
+  font-weight: 600;
+}
+
+.slider {
+  width: 100%;
+  padding: 0;
+  margin: 2px 0 0;
+  background: transparent;
+  border: none;
+  accent-color: var(--vscode-button-background);
+  cursor: pointer;
+}
+
+.slider:focus-visible {
+  outline: 1px solid var(--vscode-focusBorder);
+  outline-offset: 2px;
+}
+
+.slider:disabled {
+  cursor: default;
+}
+
+.range-hint {
+  margin: 0;
+  font-size: 0.85em;
+  opacity: 0.75;
+}

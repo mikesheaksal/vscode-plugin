@@ -139,6 +139,55 @@ export function maxCountFor(
   return Math.min(perType, limits.gpuCountMax);
 }
 
+/**
+ * Positions a slider can rest on.
+ *
+ * A linear 1..2048 slider in a ~300px sidebar is about seven values per pixel,
+ * so dragging it to an exact number is not possible. Over a wide range the
+ * slider therefore steps through a curated scale of round values — quick to
+ * reach the shape you want — while the paired text input still accepts any
+ * integer for the times you need 300 rather than 256.
+ *
+ * Small ranges (a GPU count of 1..8) get every value, where a slider is exact
+ * anyway.
+ */
+export function sliderScale(min: number, max: number): number[] {
+  if (max <= min) {
+    return [min];
+  }
+  if (max - min <= 32) {
+    return Array.from({ length: max - min + 1 }, (_, index) => min + index);
+  }
+
+  const values = new Set<number>([min, max]);
+  for (let value = 1; value <= max; value *= 2) {
+    if (value >= min) {
+      values.add(value);
+    }
+    // Halfway points above 16, so the gaps near the top stay navigable without
+    // littering the low end with 1.5 and 3.
+    const midpoint = value * 1.5;
+    if (value >= 16 && midpoint <= max && midpoint >= min) {
+      values.add(midpoint);
+    }
+  }
+  return [...values].sort((left, right) => left - right);
+}
+
+/** The scale position closest to a value, for showing where an arbitrary number sits. */
+export function nearestScaleIndex(scale: number[], value: number): number {
+  let best = 0;
+  let bestDistance = Number.POSITIVE_INFINITY;
+  for (const [index, candidate] of scale.entries()) {
+    const distance = Math.abs(candidate - value);
+    if (distance < bestDistance) {
+      best = index;
+      bestDistance = distance;
+    }
+  }
+  return best;
+}
+
 export type FieldErrors = Partial<Record<FieldKey, string>>;
 
 export interface ValidationResult {
