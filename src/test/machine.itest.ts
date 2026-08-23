@@ -52,7 +52,7 @@ suite('Machine configuration', function () {
 
   suiteTeardown(async () => {
     mock?.kill('SIGKILL');
-    rmSync(buildDir, { recursive: true, force: true });
+    rmSync(buildDir, { recursive: true, force: true, maxRetries: 20, retryDelay: 150 });
     for (const key of ['serverUrl', 'clientIdFilePath', 'tokenFilePath']) {
       await vscode.workspace.getConfiguration(SECTION).update(key, undefined, target);
     }
@@ -76,7 +76,7 @@ suite('Machine configuration', function () {
     }
     services = [];
     log.dispose();
-    rmSync(configDir, { recursive: true, force: true });
+    rmSync(configDir, { recursive: true, force: true, maxRetries: 20, retryDelay: 150 });
   });
 
   function makeService(

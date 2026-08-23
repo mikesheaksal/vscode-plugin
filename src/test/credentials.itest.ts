@@ -50,7 +50,7 @@ suite('ConfigService', () => {
     for (const key of ['serverUrl', 'clientIdFilePath', 'tokenFilePath', 'apiToken']) {
       await config().update(key, undefined, target);
     }
-    await rm(directory, { recursive: true, force: true });
+    await rm(directory, { recursive: true, force: true, maxRetries: 20, retryDelay: 150 });
   });
 
   test('reports no-server-url before anything is configured', async () => {
@@ -113,14 +113,19 @@ suite('ConfigService', () => {
 
     await writeFile(join(directory, 'token'), 'rotated-token');
 
-    // The watcher on the credential directory invalidates the cache by itself
-    // (design section 6.0), so an external tool refreshing the token is picked
-    // up without the user reloading the window. Polling rather than asserting
-    // immediately, because the watch event is asynchronous.
-    const token = await waitFor(async () => {
-      const state = await service.resolve();
-      return state.kind === 'ready' ? state.credentials.token : undefined;
-    }, 'rotated-token');
+    // An external tool refreshing the token is picked up without the user
+    // reloading the window (design section 6.0). The fs watcher usually does
+    // this within milliseconds; the mtime poll behind it guarantees an upper
+    // bound on platforms where fs.watch misses the event, which CI showed
+    // Windows doing. Hence a window generous enough for the slower path.
+    const token = await waitFor(
+      async () => {
+        const state = await service.resolve();
+        return state.kind === 'ready' ? state.credentials.token : undefined;
+      },
+      'rotated-token',
+      20_000,
+    );
     assert.equal(token, 'rotated-token');
   });
 

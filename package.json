@@ -180,7 +180,7 @@
           "type": "string",
           "default": "",
           "scope": "application",
-          "markdownDescription": "API token. Stored in plain text in `settings.json` and synchronised by Settings Sync \u2014 the extension copies it into secret storage on first read and offers to clear it from here. Prefer the **Acme Alerts: Sign In** command."
+          "markdownDescription": "API token. Stored in plain text in `settings.json` and synchronised by Settings Sync — the extension copies it into secret storage on first read and offers to clear it from here. Prefer the **Acme Alerts: Sign In** command."
         },
         "acmeAlerts.tokenFilePath": {
           "type": "string",
@@ -217,8 +217,8 @@
     "@types/vscode": "^1.90.0",
     "@typescript-eslint/eslint-plugin": "^8.18.0",
     "@typescript-eslint/parser": "^8.18.0",
-    "@vscode/test-cli": "^0.0.10",
-    "@vscode/test-electron": "^2.5.2",
+    "@vscode/test-cli": "^0.0.15",
+    "@vscode/test-electron": "^3.1.0",
     "@vscode/vsce": "^3.9.2",
     "esbuild": "^0.24.0",
     "eslint": "^9.17.0",

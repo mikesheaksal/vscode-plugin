@@ -26,10 +26,12 @@ jobs:
       - run: npm ci
       - run: npm run typecheck
       - run: npm run lint
+      # Built before testing: src/manifest.test.ts asserts the webview bundle
+      # ships, and esbuild is what produces it.
+      - run: npm run build
       # Unit tests include the suite that runs against the Go mock behind a
       # real grpc-gateway, which is why Go is set up here.
       - run: npm test
-      - run: npm run build
       - run: go vet ./...
 
   contract:

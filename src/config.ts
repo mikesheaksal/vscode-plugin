@@ -1,4 +1,5 @@
 import { watch, type FSWatcher } from 'node:fs';
+import { stat } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { dirname } from 'node:path';
 import * as vscode from 'vscode';
@@ -14,6 +15,17 @@ import { nodeFiles } from './nodeFiles';
 
 const SECTION = 'acmeAlerts';
 const SECRET_KEY = 'acmeAlerts.apiToken';
+
+/**
+ * Upper bound on noticing a credential file change.
+ *
+ * `fs.watch` gives sub-second response where it works, but it is documented as
+ * platform-dependent and CI showed it missing a rewrite on Windows. Two `stat`
+ * calls on this interval cost nothing and turn "usually immediate" into a
+ * guarantee, which is what the design actually promises: provisioning or
+ * rotating a file brings the extension to life without a window reload.
+ */
+const POLL_INTERVAL_MS = 5_000;
 
 /**
  * Why the extension cannot talk to the server yet, or that it can. These map
@@ -38,6 +50,9 @@ export class ConfigService implements vscode.Disposable {
   private inFlight: Promise<CredentialState> | undefined;
   private watchers: FSWatcher[] = [];
   private watchedKey = '';
+  private pollTimer: ReturnType<typeof setInterval> | undefined;
+  /** Last observed mtime+size per credential file, for the safety poll. */
+  private readonly fingerprints = new Map<string, string>();
   private migrationOffered = false;
   private readonly insecureWarned = new Set<string>();
 
@@ -51,6 +66,7 @@ export class ConfigService implements vscode.Disposable {
     private readonly secrets: vscode.SecretStorage,
     private readonly log: Logger,
     private readonly files: FileReader = nodeFiles,
+    private readonly pollIntervalMs: number = POLL_INTERVAL_MS,
   ) {
     this.disposables.push(
       vscode.workspace.onDidChangeConfiguration((event) => {
@@ -141,6 +157,10 @@ export class ConfigService implements vscode.Disposable {
       disposable.dispose();
     }
     this.stopWatching();
+    if (this.pollTimer !== undefined) {
+      clearInterval(this.pollTimer);
+      this.pollTimer = undefined;
+    }
   }
 
   private async resolveUncached(): Promise<CredentialState> {
@@ -150,6 +170,7 @@ export class ConfigService implements vscode.Disposable {
     const clientIdFilePath = this.clientIdFilePath;
 
     this.watchCredentialFiles(tokenFilePath, clientIdFilePath);
+    this.startPolling(tokenFilePath, clientIdFilePath);
 
     const state = await this.determineState(serverUrl, tokenFilePath, clientIdFilePath);
     this.cached = state;
@@ -299,6 +320,51 @@ export class ConfigService implements vscode.Disposable {
       }
     }
     this.watchedKey = watchedAll ? key : '';
+  }
+
+  /**
+   * The safety net under the watcher.
+   *
+   * Records each file's mtime and size, and invalidates when either moves. A
+   * file appearing counts as a change, which is the provisioning case.
+   */
+  private startPolling(...paths: string[]): void {
+    if (this.pollTimer !== undefined) {
+      return;
+    }
+    // Seeded from the current state, so the first tick reports only real
+    // changes rather than everything it sees for the first time.
+    void this.captureFingerprints(paths);
+    this.pollTimer = setInterval(() => {
+      void this.captureFingerprints(paths).then((changed) => {
+        if (changed) {
+          this.log.debug('credentials: a credential file changed');
+          this.invalidate();
+        }
+      });
+    }, this.pollIntervalMs);
+  }
+
+  /** Returns true when any fingerprint differs from the last observation. */
+  private async captureFingerprints(paths: string[]): Promise<boolean> {
+    let changed = false;
+    for (const path of paths) {
+      let fingerprint = 'absent';
+      try {
+        const stats = await stat(path);
+        fingerprint = `${stats.mtimeMs}:${stats.size}`;
+      } catch {
+        // Absent is a legitimate observation, not an error: it is the state
+        // before provisioning.
+      }
+      if (this.fingerprints.get(path) !== fingerprint) {
+        if (this.fingerprints.has(path)) {
+          changed = true;
+        }
+        this.fingerprints.set(path, fingerprint);
+      }
+    }
+    return changed;
   }
 
   private stopWatching(): void {

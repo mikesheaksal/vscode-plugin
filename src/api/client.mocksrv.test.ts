@@ -39,7 +39,8 @@ describe.skipIf(!hasGo)('ApiClient against the Go mock', () => {
     // holding the port, and the next run silently talks to a stale process
     // carrying the previous run's state.
     buildDir = mkdtempSync(join(tmpdir(), 'acme-mock-'));
-    const binary = join(buildDir, 'mock');
+    // Go does not add .exe when -o names the output, so the test must.
+    const binary = join(buildDir, process.platform === 'win32' ? 'mock.exe' : 'mock');
     const built = spawnSync('go', ['build', '-o', binary, './mock'], { encoding: 'utf8' });
     if (built.status !== 0) {
       throw new Error(`go build failed: ${built.stderr}`);
@@ -55,7 +56,7 @@ describe.skipIf(!hasGo)('ApiClient against the Go mock', () => {
 
   afterAll(() => {
     mock?.kill('SIGKILL');
-    rmSync(buildDir, { recursive: true, force: true });
+    rmSync(buildDir, { recursive: true, force: true, maxRetries: 20, retryDelay: 150 });
   });
 
   function client(overrides: Partial<{ token: string; clientId: string }> = {}): ApiClient {
