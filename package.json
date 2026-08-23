@@ -1,0 +1,234 @@
+{
+  "name": "acme-alerts",
+  "displayName": "Acme Alerts",
+  "description": "Server-pushed alerts and machine configuration, in the sidebar.",
+  "version": "0.1.0",
+  "publisher": "acme",
+  "license": "UNLICENSED",
+  "private": true,
+  "engines": {
+    "vscode": "^1.90.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "main": "./out/extension.js",
+  "activationEvents": [
+    "onStartupFinished"
+  ],
+  "contributes": {
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "acmeAlerts",
+          "title": "Alerts",
+          "icon": "media/activity-bar.svg"
+        }
+      ]
+    },
+    "views": {
+      "acmeAlerts": [
+        {
+          "id": "acmeAlerts.machine",
+          "name": "Machine",
+          "type": "webview"
+        },
+        {
+          "id": "acmeAlerts.pending",
+          "name": "Alerts",
+          "type": "tree"
+        }
+      ]
+    },
+    "viewsWelcome": [
+      {
+        "view": "acmeAlerts.pending",
+        "contents": "Acme Alerts needs a server URL before it can connect.\n[Open Settings](command:acmeAlerts.openSettings)",
+        "when": "acmeAlerts.state == 'no-server-url'"
+      },
+      {
+        "view": "acmeAlerts.pending",
+        "contents": "No client id found on this machine.\n\nThis file identifies the machine to the server and is provisioned for you; the extension never creates one. Check the log for the path that was searched.\n[Show Log](command:acmeAlerts.showLog)\n[Retry](command:acmeAlerts.refresh)",
+        "when": "acmeAlerts.state == 'no-client-id'"
+      },
+      {
+        "view": "acmeAlerts.pending",
+        "contents": "Sign in to start receiving alerts.\n[Sign In](command:acmeAlerts.signIn)",
+        "when": "acmeAlerts.state == 'signed-out'"
+      },
+      {
+        "view": "acmeAlerts.pending",
+        "contents": "No alerts. You're all caught up.",
+        "when": "acmeAlerts.state == 'ready'"
+      }
+    ],
+    "commands": [
+      {
+        "command": "acmeAlerts.showMachine",
+        "title": "Show Machine",
+        "category": "Acme Alerts"
+      },
+      {
+        "command": "acmeAlerts.signIn",
+        "title": "Sign In",
+        "category": "Acme Alerts"
+      },
+      {
+        "command": "acmeAlerts.signOut",
+        "title": "Sign Out",
+        "category": "Acme Alerts"
+      },
+      {
+        "command": "acmeAlerts.showLog",
+        "title": "Show Log",
+        "category": "Acme Alerts"
+      },
+      {
+        "command": "acmeAlerts.openSettings",
+        "title": "Open Settings",
+        "category": "Acme Alerts"
+      },
+      {
+        "command": "acmeAlerts.refresh",
+        "title": "Refresh",
+        "category": "Acme Alerts",
+        "icon": "$(refresh)"
+      },
+      {
+        "command": "acmeAlerts.showAlert",
+        "title": "Show Alert",
+        "category": "Acme Alerts"
+      },
+      {
+        "command": "acmeAlerts.answerPrimary",
+        "title": "Answer",
+        "category": "Acme Alerts",
+        "icon": "$(check)"
+      },
+      {
+        "command": "acmeAlerts.answerSecondary",
+        "title": "Answer (second option)",
+        "category": "Acme Alerts",
+        "icon": "$(close)"
+      },
+      {
+        "command": "acmeAlerts.openInEditor",
+        "title": "Open in Editor",
+        "category": "Acme Alerts",
+        "icon": "$(link-external)"
+      },
+      {
+        "command": "acmeAlerts.reportIssue",
+        "title": "Report Issue",
+        "category": "Acme Alerts"
+      }
+    ],
+    "menus": {
+      "view/title": [
+        {
+          "command": "acmeAlerts.refresh",
+          "when": "view == acmeAlerts.pending || view == acmeAlerts.machine",
+          "group": "navigation@2"
+        },
+        {
+          "command": "acmeAlerts.openInEditor",
+          "when": "view == acmeAlerts.machine",
+          "group": "navigation@1"
+        }
+      ],
+      "commandPalette": [
+        {
+          "command": "acmeAlerts.refresh",
+          "when": "false"
+        },
+        {
+          "command": "acmeAlerts.showAlert",
+          "when": "false"
+        },
+        {
+          "command": "acmeAlerts.answerPrimary",
+          "when": "false"
+        },
+        {
+          "command": "acmeAlerts.answerSecondary",
+          "when": "false"
+        }
+      ],
+      "view/item/context": [
+        {
+          "command": "acmeAlerts.answerPrimary",
+          "when": "view == acmeAlerts.pending && viewItem =~ /^acmeAlert:[12]$/",
+          "group": "inline@1"
+        },
+        {
+          "command": "acmeAlerts.answerSecondary",
+          "when": "view == acmeAlerts.pending && viewItem == acmeAlert:2",
+          "group": "inline@2"
+        }
+      ]
+    },
+    "configuration": {
+      "title": "Acme Alerts",
+      "properties": {
+        "acmeAlerts.serverUrl": {
+          "type": "string",
+          "default": "",
+          "scope": "application",
+          "markdownDescription": "Base URL of the alerts server, e.g. `https://alerts.example.com`."
+        },
+        "acmeAlerts.apiToken": {
+          "type": "string",
+          "default": "",
+          "scope": "application",
+          "markdownDescription": "API token. Stored in plain text in `settings.json` and synchronised by Settings Sync — the extension copies it into secret storage on first read and offers to clear it from here. Prefer the **Acme Alerts: Sign In** command."
+        },
+        "acmeAlerts.tokenFilePath": {
+          "type": "string",
+          "default": "",
+          "scope": "application",
+          "markdownDescription": "Path to a file containing the API token, used when no token is set above or in secret storage. Defaults to `~/.config/acme-alerts/token` (`%APPDATA%\\acme-alerts\\token` on Windows)."
+        },
+        "acmeAlerts.clientIdFilePath": {
+          "type": "string",
+          "default": "",
+          "scope": "application",
+          "markdownDescription": "Path to a file containing this machine's client id, which the server uses to route alerts. Defaults to `~/.config/acme-alerts/client-id` (`%APPDATA%\\acme-alerts\\client-id` on Windows). The extension never generates this value."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "build": "node esbuild.mjs",
+    "watch": "node esbuild.mjs --watch",
+    "typecheck": "tsc --noEmit && tsc --noEmit -p tsconfig.webview.json",
+    "lint": "eslint src",
+    "test": "vitest run",
+    "check": "npm run typecheck && npm run lint && npm run build && npm run test",
+    "vscode:prepublish": "node esbuild.mjs --production",
+    "pretest:integration": "npm run build && tsc -p tsconfig.test.json",
+    "test:integration": "vscode-test",
+    "package": "vsce package --no-dependencies"
+  },
+  "devDependencies": {
+    "@bufbuild/protobuf": "^2.14.0",
+    "@bufbuild/protoc-gen-es": "^2.14.0",
+    "@types/mocha": "^10.0.10",
+    "@types/node": "^22.10.0",
+    "@types/vscode": "^1.90.0",
+    "@typescript-eslint/eslint-plugin": "^8.18.0",
+    "@typescript-eslint/parser": "^8.18.0",
+    "@vscode/test-cli": "^0.0.15",
+    "@vscode/test-electron": "^3.1.0",
+    "@vscode/vsce": "^3.9.2",
+    "esbuild": "^0.24.0",
+    "eslint": "^9.17.0",
+    "mocha": "^10.8.2",
+    "typescript": "^5.7.2",
+    "vitest": "^2.1.8"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/mikesheaksal/vscode-plugin.git"
+  },
+  "icon": "media/icon.png"
+}

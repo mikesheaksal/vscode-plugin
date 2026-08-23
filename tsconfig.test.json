@@ -1,0 +1,14 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "noEmit": false,
+    "outDir": "out",
+    "rootDir": "."
+  },
+  // Emits the extension's own modules alongside the integration tests, so a
+  // test can import ConfigService directly and exercise it against the real
+  // vscode APIs. Unit tests (*.test.ts) stay out: they import vitest, which is
+  // not present inside the extension host.
+  "include": ["src/**/*.ts"],
+  "exclude": ["node_modules", "out", "src/**/*.test.ts", "src/webview"]
+}

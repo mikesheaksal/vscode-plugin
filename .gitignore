@@ -1,0 +1,7 @@
+node_modules/
+out/
+*.vsix
+.vscode-test/
+# built from src/webview by esbuild
+media/form.js
+media/form.js.map

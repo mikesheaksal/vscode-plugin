@@ -1,0 +1,32 @@
+# Go output for the backend and the in-repo mock.
+#
+# Only our own package is generated: the googleapis imports resolve to the
+# published google.golang.org/genproto modules, so generating local copies
+# would collide with them.
+#
+# Plugins are local rather than remote because the buf.build registry is not
+# reachable from every environment this repo builds in. `make tools` installs
+# them.
+version: v2
+managed:
+  enabled: true
+  disable:
+    - file_option: go_package
+      path: third_party
+inputs:
+  - directory: .
+    paths:
+      - acme
+plugins:
+  - local: protoc-gen-go
+    out: ../gen/go
+    opt: paths=source_relative
+  - local: protoc-gen-go-grpc
+    out: ../gen/go
+    opt: paths=source_relative
+  - local: protoc-gen-grpc-gateway
+    out: ../gen/go
+    opt: paths=source_relative
+  - local: protoc-gen-openapiv2
+    out: ../gen/openapi
+    opt: allow_merge=true,merge_file_name=acme-alerts

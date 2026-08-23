@@ -1,0 +1,75 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  extension:
+    # The credential paths, the filesystem watcher and the mock's process
+    # handling all differ per platform, so all three are built and tested.
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.24'
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm run lint
+      # Built before testing: src/manifest.test.ts asserts the webview bundle
+      # ships, and esbuild is what produces it.
+      - run: npm run build
+      # Unit tests include the suite that runs against the Go mock behind a
+      # real grpc-gateway, which is why Go is set up here.
+      - run: npm test
+      - run: go vet ./...
+
+  contract:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # buf breaking compares against main, which needs its history.
+          fetch-depth: 0
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.24'
+      - run: go install github.com/bufbuild/buf/cmd/buf@v1.47.2
+      - run: buf lint
+        working-directory: proto
+      - name: buf breaking against main
+        run: make breaking
+
+  integration:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.24'
+      - run: npm ci
+      # The integration suite starts the Go mock, so it needs a real build.
+      - run: npm run build
+      # Linux has no display; the extension host needs one.
+      - if: runner.os == 'Linux'
+        run: xvfb-run -a npm run test:integration
+      - if: runner.os != 'Linux'
+        run: npm run test:integration

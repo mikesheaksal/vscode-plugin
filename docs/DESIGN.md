@@ -204,6 +204,11 @@ Consequences, all of which the client handles:
 - **Buffering is still the risk it always was.** The Go handler must call `Flush()` per
   message, and any proxy in front needs `X-Accel-Buffering: no` and no response
   compression, or events arrive in clumps. This is what the long-poll fallback exists for.
+- **The server must send a heartbeat immediately on stream open.** grpc-gateway does not
+  flush response headers until the first message, so a stream that opens with nothing to
+  say leaves the client's `fetch()` unresolved — indistinguishable from a server that
+  never answered — until the first 25s tick. Found by the Phase 3 integration tests, which
+  hung on exactly this; the mock now sends one and the real backend must too.
 
 ### 5.2 JSON field naming
 
@@ -257,19 +262,44 @@ client map a violation to the right input without a bespoke error vocabulary. **
 cross-field limits arrive later, they need no client change** — a new violation on
 `spec.cpu_cores` renders next to the CPU field automatically.
 
-### 5.5 Code generation
+### 5.5 What the mock confirmed
 
-`buf generate` (see [`proto/buf.gen.yaml`](../proto/buf.gen.yaml)) produces, from the one
-file: Go message and gRPC stubs, the grpc-gateway mux, an OpenAPI v2 document, and
-**TypeScript types for the extension**. The client speaks JSON to the gateway rather than
+Phase 3 put a Go mock behind a real grpc-gateway and pointed the client at it, so the
+claims in this section are now observations rather than expectations:
+
+```
+{"result":{"sequence":"1","alert":{"alertId":"alt_1","severity":"SEVERITY_WARNING", ...}}}
+```
+
+- The stream envelope is `{"result": …}` per line, with no `data:` framing.
+- `sequence` is a **JSON string**, as the uint64 rule predicts.
+- Field names are lowerCamelCase; enums are full string names.
+- `EmitUnpopulated: false` keeps an unset `gpu_count` genuinely absent, and also means
+  `requiresRestart` is **omitted rather than `false`** — the client must treat absent as
+  false, which the generated types do.
+- `INVALID_ARGUMENT` carries `google.rpc.BadRequest` with `fieldViolations[].field` set to
+  the proto path, so `spec.ram_gb` maps straight onto the RAM input.
+
+### 5.6 Code generation
+
+`make generate` produces, from the one file: Go message and gRPC stubs, the grpc-gateway
+mux, an OpenAPI v2 document, and **TypeScript types for the extension**. Two templates,
+because the Go side must not regenerate the googleapis imports it gets from published
+modules while the TypeScript side has no published equivalent to depend on. The client speaks JSON to the gateway rather than
 gRPC, but generating its types from the same proto means a field rename breaks the
 TypeScript build instead of a user's form. That is most of the payoff of doing this
 proto-first, and it costs one plugin entry.
 
-`buf breaking` in CI against the main branch is worth adding on day one, because the
-.vsix distribution model (Phase 9) means old clients stay in the field indefinitely.
+`buf breaking` in CI against the main branch runs from day one, because the .vsix
+distribution model (Phase 9) means old clients stay in the field indefinitely.
 
-### 5.6 If grpc-gateway is dropped
+Plugins are **local, not remote**, and the googleapis imports are **vendored** under
+`proto/third_party`: the buf.build registry is not reachable from every environment this
+repo builds in, and a contract that cannot be regenerated in CI is not much of a contract.
+`make tools` installs everything. Generated output is committed, so building the extension
+needs only npm and building the mock needs only Go.
+
+### 5.7 If grpc-gateway is dropped
 
 Nothing above except §5.1–5.3 depends on it. The six operations, their payloads, the
 persistence and revocation semantics, and every client behaviour in §7–§9 are transport
@@ -364,6 +394,12 @@ waste the user's time: report it as "This token is not authorized for client
   not produce a thundering herd. Reset on any successfully received event.
 - After 5 consecutive stream failures, fall back to long-poll
   (`ListPendingAlerts` with `wait_seconds=30`) and retry the stream every 5 minutes.
+- **The polling fallback needs a floor between requests.** `ListPendingAlerts` returns
+  immediately whenever anything is already outstanding, so a client that re-polls as soon
+  as the previous call returns spins as fast as the network allows for as long as the user
+  leaves an alert unanswered. Phase 4 found this the moment a test left an alert sitting.
+  The client waits at least 5s after any poll that came back with alerts; an empty poll
+  already blocked for its full `wait_seconds` and re-polls straight away.
 
 **Implementation note:** the client consumes `fetch(...).body` and splits the NDJSON
 stream on newlines, unwrapping each line's `result` field (§5.1). That is a handful of
@@ -390,6 +426,24 @@ Two behaviours worth knowing, because they shape the UX:
   `undefined` on dismissal. **There is no API to close a notification programmatically.**
   This matters in §9.3.
 
+### 7.2a Coalescing is a time window, not a batch
+
+The earlier draft decided individual-versus-summary per batch of arriving alerts, which
+worked while polling returned alerts in groups. Over the stream each alert is its own
+event, so six arriving together produced three individual notifications and then
+summaries — the exact stacking the rule exists to prevent. Phase 5 found this the moment
+the stream replaced polling.
+
+Fresh alerts are therefore collected for a short window (300ms) before anything is shown,
+and the individual-or-summary decision is made once over that window. Two things fall out
+of it:
+
+- The window is the same code path for both sources, so polling and streaming announce
+  identically.
+- An alert that is withdrawn inside the window is dropped from the announcement rather
+  than announced and immediately removed. Replay after a reconnect makes that sequence
+  ordinary, not exotic.
+
 ### 7.3 Alert bursts, and the alerts view
 
 Ten alerts at once produce ten stacked notifications, and the user will miss most of them.
@@ -404,7 +458,10 @@ and the view is the durable record.
   answer, since the original notification cannot be reopened.
 - Each tree item carries inline action buttons (`menus: view/item/context`,
   `group: "inline"`) for the alert's one or two responses, so the common case is answered
-  in one click without opening anything.
+  in one click without opening anything. VS Code menus are static, so the item's
+  `contextValue` carries the button count (`acmeAlert:1` / `acmeAlert:2`) and the second
+  action's `when` clause keys off it — a one-button alert must not show a phantom second
+  action.
 - Answered alerts stay in a collapsed "Recent" node for the session, dimmed with the
   chosen response in the item description.
 
@@ -426,9 +483,14 @@ the server withdraws it. Two things follow:
   any are outstanding. Replaying six-day-old notifications at every window open is how
   users learn to click things away without reading them.
 
-`ListPendingAlerts` on activation is the reconciliation step: the server is authoritative
-about what is still live, so anything persisted locally but absent from that response was
-answered or revoked while we were away, and is dropped.
+`ListPendingAlerts` on activation, and on every stream (re)connect, is the reconciliation
+step: the server is authoritative about what is still live, so anything persisted locally
+but absent from that response was answered or revoked while we were away, and is dropped.
+
+**Reconciliation must only ever run against that complete list.** A stream event is one
+thing that happened, not a statement about what is outstanding; treating a single-alert
+event as authoritative silently discards every other pending alert. Phase 5 shipped that
+bug for exactly as long as it took the end-to-end tests to run.
 
 **Revocation** arrives as an `AlertRevoked` event. The alert is removed from the view and
 the badge decrements. If its notification is still on screen it cannot be closed
@@ -481,22 +543,39 @@ than a rewrite.
 | Field | Control | Range | Notes |
 |---|---|---|---|
 | GPU Type | `<select>` | options from `GetMachineConfig` | Options are dynamic; the field itself is not |
-| Number of GPUs | `<select>` 1…N | 1–`maxCount` (≤8) | Hidden when GPU Type is `none` |
-| CPU cores | text, `inputmode="numeric"` | 1–256 | |
-| RAM (GB) | text, `inputmode="numeric"` | 1–2048 | |
-| SSD (GB) | text, `inputmode="numeric"` | 1–2048 | |
+| Number of GPUs | slider + readout | 1–`maxCount` (≤8) | Hidden when GPU Type is `none` |
+| CPU cores | slider + text box | 1–256 | |
+| RAM (GB) | slider + text box | 1–2048 | |
+| SSD (GB) | slider + text box | 1–2048 | |
 
-Two control choices worth justifying:
+Three control choices worth justifying:
 
-- **GPU count is a `<select>`, not a number input.** The range is at most eight discrete
-  values, it is regenerated whenever GPU Type changes (because `maxCount` is per type), and
-  a dropdown makes an out-of-range value unrepresentable rather than merely rejected.
-- **The other three are `type="text"` with `inputmode="numeric"`, not `type="number"`.**
+- **The numeric fields pair a slider with a text box, bound to the same value.** Neither
+  alone is sufficient. A linear 1–2048 slider in a ~300px sidebar is roughly seven values
+  per pixel, so it cannot land on an exact number; a bare text box makes exploring the
+  range tedious. The slider reaches a shape quickly, the box says exactly 300 rather
+  than 256.
+- **Over a wide range the slider steps through a curated scale**, not every integer:
+  powers of two plus their halfway points above 16, always including both bounds — about
+  twenty positions for 1–2048, rendered as tick marks. Any integer is still accepted
+  through the text box, so this constrains the *slider* without constraining the *value*.
+  A typed value that is off-scale parks the handle at the nearest position and is left
+  alone.
+- **GPU count is a slider with a readout and no text box.** At most eight discrete values
+  fit a slider exactly, so a box would add nothing — and the slider makes an out-of-range
+  count unrepresentable rather than merely rejected, which is what the earlier dropdown
+  was for.
+- **The text boxes are `type="text"` with `inputmode="numeric"`, not `type="number"`.**
   `type="number"` has two properties that hurt here: its `.value` is the empty string when
   the user types something unparseable, so we cannot echo back what they actually typed;
   and its scroll-wheel behaviour silently changes the value when a user scrolls the
   sidebar with the cursor over the field. Reading raw text and validating it ourselves
-  avoids both. `inputmode="numeric"` still gets the numeric keypad where that applies.
+  avoids both.
+
+The slider commits on release rather than on every pixel, so validation and the
+Apply/No-changes state do not flicker through a drag. Typing updates the Apply button
+directly rather than through a re-render, since rebuilding the inputs would take the
+caret away mid-keystroke.
 
 ### 8.3 Conditional logic for GPU count
 
@@ -678,7 +757,8 @@ validates first, reaching this on apply means something changed in between — r
 show what.
 
 **A failed apply does not go in the outbox** — see §9.1, the one place where durable retry
-is the wrong answer.
+is the wrong answer. The message says so: "Nothing was applied — try again", rather than
+implying something is queued.
 
 ### 8.9 Concurrent changes
 
@@ -712,10 +792,25 @@ hatch if field count grows.
 **Alert responses** are user intent that must not evaporate because the network blipped,
 so they go through a durable queue in `globalState`:
 
-- Each entry: `{ id, kind, url, body, idempotencyKey, attempts, nextAttemptAt }`.
+- Each entry is a **typed alert answer**, not a generic queued request:
+  `{ id, alertId, buttonId, chosenLabel, respondedAt, idempotencyKey, attempts, nextAttemptAt }`.
+  Applies are excluded by design (below) and dismissals by judgement — a dismissal is a
+  courtesy to the server rather than the user's decision, and queueing them would fill the
+  outbox with things nobody is waiting on. That leaves exactly one kind of entry, so a
+  generic url-and-body shape would buy nothing and lose type safety.
+- **One queued answer per alert.** Answering twice replaces the first rather than racing
+  both to the server.
 - Flushed on: successful send of anything else, stream reconnect, extension activation, and a
   60s timer while non-empty.
-- Bounded at 100 entries and 7 days; older entries are dropped with a log line.
+- Bounded at 100 entries and 7 days; the cap drops the *oldest*, since a fresh answer
+  matters more than one that has been failing for a week. Expiry is logged rather than
+  silent: an answer disappearing without a word is worse than one that never sent.
+- **The user's decision is recorded locally either way.** The alert leaves the pending
+  list and appears under Recent as "Approve · sending…" with an upload icon, so the view
+  never implies the server has something it does not.
+- **A refusal removes the entry.** `FAILED_PRECONDITION`, `ABORTED` and `INVALID_ARGUMENT`
+  mean the server has an opinion; retrying cannot change it. Only a network failure or a
+  transient status keeps an entry queued.
 - Because every entry carries an idempotency key, replaying after an ambiguous failure is
   safe.
 

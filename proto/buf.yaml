@@ -1,8 +1,12 @@
 version: v2
 modules:
   - path: .
-deps:
-  - buf.build/googleapis/googleapis
+    excludes:
+      - third_party
+  # Vendored googleapis definitions. The buf.build registry is not reachable
+  # from every environment this repo builds in, so the imports live in the tree
+  # rather than being resolved from a remote module.
+  - path: third_party
 lint:
   use:
     - STANDARD
@@ -11,6 +15,10 @@ lint:
     # SubscribeEventsResponse would describe the transport rather than the
     # thing, and every call site reads worse for it.
     - RPC_RESPONSE_STANDARD_NAME
+  ignore:
+    - third_party
 breaking:
   use:
     - FILE
+  ignore:
+    - third_party

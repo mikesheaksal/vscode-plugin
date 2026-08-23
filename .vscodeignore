@@ -1,0 +1,25 @@
+.gitignore
+.vscode/**
+.vscode-test/**
+.vscode-test.mjs
+src/**
+proto/**
+docs/**
+node_modules/**
+esbuild.mjs
+eslint.config.mjs
+vitest.config.ts
+tsconfig.json
+tsconfig.test.json
+tsconfig.webview.json
+# out/src is the tsc build used by the integration tests; only the bundle ships.
+out/src/**
+# Backend and contract sources: needed to develop, not to run the extension.
+mock/**
+gen/**
+go.mod
+go.sum
+Makefile
+.github/**
+**/*.map
+**/*.ts
