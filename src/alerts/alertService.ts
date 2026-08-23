@@ -1,5 +1,10 @@
 import * as vscode from 'vscode';
-import { AlertOutcome, type Alert, type Event } from '../gen/acme/alerts/v1/alerts_pb';
+import {
+  AlertOutcome,
+  type Alert,
+  type Event,
+  type MachineConfigChanged,
+} from '../gen/acme/alerts/v1/alerts_pb';
 import { Severity } from '../gen/acme/alerts/v1/alerts_pb';
 import type { ApiClient } from '../api/client';
 import { ApiError, NetworkError } from '../api/errors';
@@ -55,6 +60,11 @@ const MIN_BACKOFF_MS = 1_000;
 const MAX_BACKOFF_MS = 60_000;
 
 export interface AlertServiceOptions {
+  /**
+   * Handler for configuration-change events, which share the alert stream.
+   * Owned by the machine apply service; this class only routes them.
+   */
+  onMachineConfigChanged?: (event: MachineConfigChanged) => void | Promise<void>;
   /** Skip the event stream and poll only. Used by tests of the fallback path. */
   pollOnly?: boolean;
   /** Passed through to EventStream. */
@@ -227,8 +237,8 @@ export class AlertService implements vscode.Disposable {
         break;
       }
       case 'machineConfigChanged':
-        // Phase 6b consumes this to refresh the form.
         this.log.debug('Machine configuration changed');
+        await this.options.onMachineConfigChanged?.(event.payload.value);
         break;
       case 'heartbeat':
         break;

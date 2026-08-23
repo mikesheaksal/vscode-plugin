@@ -3,6 +3,7 @@ import { AlertService } from './alerts/alertService';
 import { ApiClient } from './api/client';
 import { ConfigService } from './config';
 import { Logger } from './log';
+import { MachineApplyService } from './machine/applyService';
 import { MachineConfigService } from './machine/machineConfig';
 import { StateController } from './state';
 import { AlertsTreeProvider, PendingAlertItem } from './views/alertsTree';
@@ -57,7 +58,16 @@ export function activate(context: vscode.ExtensionContext): void {
     }),
   );
 
-  const alerts = new AlertService(context.globalState, log, alertsTree, config, clientFor);
+  const applyService = new MachineApplyService(machineConfig, log, clientFor);
+  machine.onApply = (spec) => applyService.apply(spec);
+  machine.onCancelChange = () => applyService.cancel();
+  context.subscriptions.push(applyService);
+
+  const alerts = new AlertService(context.globalState, log, alertsTree, config, clientFor, undefined, {
+    // Completion of a configuration change arrives on the same stream as
+    // alerts, so the alert service hands it on rather than owning it.
+    onMachineConfigChanged: (event) => applyService.onConfigChanged(event),
+  });
   context.subscriptions.push(alerts);
 
   context.subscriptions.push(

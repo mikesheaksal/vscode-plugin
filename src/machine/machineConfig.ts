@@ -8,7 +8,12 @@ import {
   type Limits,
   type MachineSpec,
 } from '../core/machineForm';
-import type { GetMachineConfigResponse } from '../gen/acme/alerts/v1/alerts_pb';
+import type { ServerClock } from '../core/changePreview';
+import type {
+  GetMachineConfigResponse,
+  MachineChange,
+  MachineConfigChanged,
+} from '../gen/acme/alerts/v1/alerts_pb';
 import type { Logger } from '../log';
 
 const CACHE_KEY = 'acmeAlerts.machineConfig';
@@ -23,6 +28,13 @@ export interface MachineConfigSnapshot {
   /** Set while a change is being applied; the form renders read-only. */
   pendingChangeId?: string | undefined;
   fetchedAt: string;
+}
+
+/** A change in flight, with its cancellation deadline on this machine's clock. */
+export interface PendingChange {
+  changeId: string;
+  /** Absolute local time, already corrected for clock skew. Undefined when not cancellable. */
+  cancellableUntilLocalMs?: number | undefined;
 }
 
 /**
@@ -41,6 +53,7 @@ export type MachineConfigState =
 export class MachineConfigService implements vscode.Disposable {
   private state: MachineConfigState;
   private inFlight: Promise<void> | undefined;
+  private pending: PendingChange | undefined;
 
   private readonly emitter = new vscode.EventEmitter<MachineConfigState>();
   readonly onDidChange = this.emitter.event;
@@ -58,6 +71,59 @@ export class MachineConfigService implements vscode.Disposable {
 
   get current(): MachineConfigState {
     return this.state;
+  }
+
+  get pendingChange(): PendingChange | undefined {
+    return this.pending;
+  }
+
+  /**
+   * Records a change accepted by the server.
+   *
+   * Held locally as well as in the snapshot so the form locks immediately,
+   * rather than only after the next fetch.
+   */
+  setPendingChange(change: MachineChange, clock: ServerClock): void {
+    const until = change.cancellableUntil;
+    this.pending = {
+      changeId: change.changeId,
+      cancellableUntilLocalMs: until
+        ? clock.toLocal(Number(until.seconds) * 1000 + Math.floor(until.nanos / 1e6))
+        : undefined,
+    };
+    if (this.state.kind === 'ready') {
+      this.setState({
+        kind: 'ready',
+        config: { ...this.state.config, pendingChangeId: change.changeId },
+        stale: this.state.stale,
+      });
+    }
+  }
+
+  /** Folds a completion event in: new current values, new version, no pending change. */
+  applyChangedEvent(event: MachineConfigChanged): void {
+    this.pending = undefined;
+    if (this.state.kind !== 'ready') {
+      void this.refresh();
+      return;
+    }
+    const config: MachineConfigSnapshot = {
+      ...this.state.config,
+      version: event.version,
+      current: event.current
+        ? {
+            gpuTypeId: event.current.gpuTypeId,
+            gpuCount: event.current.gpuCount,
+            cpuCores: event.current.cpuCores,
+            ramGb: event.current.ramGb,
+            ssdGb: event.current.ssdGb,
+          }
+        : this.state.config.current,
+      pendingChangeId: undefined,
+      fetchedAt: new Date().toISOString(),
+    };
+    void this.memento.update(CACHE_KEY, config);
+    this.setState({ kind: 'ready', config, stale: false });
   }
 
   /** Fetches unless the cache is fresh enough. */
@@ -89,6 +155,13 @@ export class MachineConfigService implements vscode.Disposable {
     try {
       const response = await client.getMachineConfig();
       const snapshot = toSnapshot(response, this.log);
+      // The server is authoritative about whether a change is still running: a
+      // completion event lost to a dropped stream is recovered here.
+      if (snapshot.pendingChangeId === undefined) {
+        this.pending = undefined;
+      } else if (this.pending?.changeId !== snapshot.pendingChangeId) {
+        this.pending = { changeId: snapshot.pendingChangeId };
+      }
       await this.memento.update(CACHE_KEY, snapshot);
       this.setState({ kind: 'ready', config: snapshot, stale: false });
       this.log.debug(`Machine config ${snapshot.version} loaded`);

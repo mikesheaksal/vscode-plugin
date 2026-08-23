@@ -30,6 +30,8 @@ interface InitMessage {
   message?: string;
   stale?: boolean;
   readOnly?: boolean;
+  /** Set while a change is in flight; carries the cancel deadline in local time. */
+  pending?: { changeId: string; cancellableUntilLocalMs?: number };
   gpuTypes?: GpuTypeOption[];
   limits?: Limits;
   current?: MachineSpec;
@@ -59,6 +61,8 @@ let busy = false;
 let readOnly = false;
 /** Kept so typing can update the buttons without rebuilding the DOM under the cursor. */
 let applyButton: HTMLButtonElement | undefined;
+let pending: InitMessage['pending'];
+let countdownTimer: ReturnType<typeof setInterval> | undefined;
 
 window.addEventListener('message', (event: MessageEvent<HostMessage>) => {
   const message = event.data;
@@ -91,6 +95,7 @@ function applyInit(message: InitMessage): void {
   // A saved draft wins over the current configuration: the user was mid-edit.
   draft = message.draft ?? draftFromSpec(message.current);
   readOnly = message.readOnly ?? false;
+  pending = message.pending;
   serverErrors = {};
   render();
   if (message.stale) {
@@ -123,6 +128,7 @@ function render(formError?: string): void {
   const changed = isChanged(draft, current);
 
   root.innerHTML = '';
+  stopCountdown();
   const form = el('form', 'form');
   form.addEventListener('submit', (event) => {
     event.preventDefault();
@@ -218,6 +224,10 @@ function render(formError?: string): void {
   syncActions();
   actions.append(apply);
 
+  if (readOnly && pending) {
+    actions.append(cancelButton(pending));
+  }
+
   if (changed && !readOnly) {
     const discard = el('button', 'secondary', 'Discard') as HTMLButtonElement;
     discard.type = 'button';
@@ -232,6 +242,56 @@ function render(formError?: string): void {
   }
   form.append(actions);
   root.append(form);
+
+  if (readOnly) {
+    root.prepend(el('div', 'banner applying', 'Applying changes to your machine…'));
+  }
+}
+
+/**
+ * Cancel, with a live countdown.
+ *
+ * The deadline arrives already corrected for the difference between this
+ * machine's clock and the server's; a laptop four minutes fast would otherwise
+ * never see the button. The countdown is advisory either way — the server
+ * decides whether a cancel arrived in time, and losing that race is handled as
+ * a normal outcome rather than an error.
+ */
+function cancelButton(active: NonNullable<InitMessage['pending']>): HTMLButtonElement {
+  const button = el('button', 'secondary', 'Cancel') as HTMLButtonElement;
+  button.type = 'button';
+  button.addEventListener('click', () => {
+    button.disabled = true;
+    vscode.postMessage({ type: 'cancelChange' });
+  });
+
+  const deadline = active.cancellableUntilLocalMs;
+  if (deadline === undefined) {
+    button.disabled = true;
+    button.textContent = 'Cannot be cancelled';
+    return button;
+  }
+
+  const tick = (): void => {
+    const remaining = Math.max(0, Math.ceil((deadline - Date.now()) / 1000));
+    if (remaining <= 0) {
+      button.disabled = true;
+      button.textContent = 'Too late to cancel';
+      stopCountdown();
+      return;
+    }
+    button.textContent = `Cancel (${remaining}s)`;
+  };
+  tick();
+  countdownTimer = setInterval(tick, 1000);
+  return button;
+}
+
+function stopCountdown(): void {
+  if (countdownTimer !== undefined) {
+    clearInterval(countdownTimer);
+    countdownTimer = undefined;
+  }
 }
 
 /**

@@ -162,3 +162,10 @@ button:disabled {
   font-size: 0.85em;
   opacity: 0.75;
 }
+
+/* The applying state: the form is locked and the only live control is Cancel,
+   whose countdown runs against the server's clock, not this machine's. */
+.banner.applying {
+  background: var(--vscode-inputValidation-infoBackground);
+  border-color: var(--vscode-inputValidation-infoBorder);
+}

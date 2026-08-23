@@ -757,7 +757,8 @@ validates first, reaching this on apply means something changed in between — r
 show what.
 
 **A failed apply does not go in the outbox** — see §9.1, the one place where durable retry
-is the wrong answer.
+is the wrong answer. The message says so: "Nothing was applied — try again", rather than
+implying something is queued.
 
 ### 8.9 Concurrent changes
 

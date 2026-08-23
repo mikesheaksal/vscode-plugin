@@ -7,7 +7,11 @@ import {
   type MachineSpec,
 } from '../core/machineForm';
 import type { Logger } from '../log';
-import type { MachineConfigService, MachineConfigState } from '../machine/machineConfig';
+import type {
+  MachineConfigService,
+  MachineConfigState,
+  PendingChange,
+} from '../machine/machineConfig';
 
 const DRAFT_KEY = 'acmeAlerts.machineDraft';
 
@@ -27,8 +31,12 @@ export class MachineViewProvider implements vscode.WebviewViewProvider {
   private panel: vscode.WebviewPanel | undefined;
   private readonly disposables: vscode.Disposable[] = [];
 
-  /** Set by Phase 6b to actually apply a change. */
-  onApply: ((spec: MachineSpec) => Promise<void>) | undefined;
+  /** Supplied by the apply service; previews, confirms and applies. */
+  onApply:
+    | ((spec: MachineSpec) => Promise<{ ok: boolean; error?: string; fieldErrors?: FieldErrors }>)
+    | undefined;
+  /** Supplied by the apply service; aborts a change inside its window. */
+  onCancelChange: (() => Promise<void>) | undefined;
 
   constructor(
     private readonly extensionUri: vscode.Uri,
@@ -155,6 +163,9 @@ export class MachineViewProvider implements vscode.WebviewViewProvider {
       case 'apply':
         await this.apply(payload.spec);
         break;
+      case 'cancelChange':
+        await this.onCancelChange?.();
+        break;
       default:
         this.log.debug(`Unhandled webview message: ${String(payload.type)}`);
     }
@@ -176,17 +187,30 @@ export class MachineViewProvider implements vscode.WebviewViewProvider {
     }
 
     if (!this.onApply) {
-      // Phase 6b wires this up. Until then, say so rather than appearing to
-      // succeed.
-      this.reportResult(false, 'Applying changes arrives in the next phase.');
+      this.reportResult(false, 'Applying changes is not available.');
       return;
     }
-    await this.onApply(checked.spec);
+
+    this.setBusy(true);
+    try {
+      const result = await this.onApply(checked.spec);
+      this.reportResult(result.ok, result.error, result.fieldErrors);
+      if (result.ok) {
+        // The change is accepted and now applying; the form reflects that
+        // through the pending state rather than a saved draft.
+        await this.workspaceState.update(DRAFT_KEY, undefined);
+      }
+    } finally {
+      this.setBusy(false);
+    }
   }
 
   /** Sends the current state and any saved draft to the webview. */
   private post(): void {
-    this.broadcast({ type: 'init', ...describe(this.config.current, this.savedDraft()) });
+    this.broadcast({
+      type: 'init',
+      ...describe(this.config.current, this.savedDraft(), this.config.pendingChange),
+    });
   }
 
   private savedDraft(): FormDraft | undefined {
@@ -221,6 +245,7 @@ export class MachineViewProvider implements vscode.WebviewViewProvider {
 function describe(
   state: MachineConfigState,
   draft: FormDraft | undefined,
+  pending: PendingChange | undefined,
 ): Record<string, unknown> {
   switch (state.kind) {
     case 'loading':
@@ -237,6 +262,7 @@ function describe(
         limits: state.config.limits,
         current: state.config.current,
         draft,
+        pending,
         // A change already in flight means the form is read-only until it
         // finishes, so a second change cannot be queued on top of the first.
         readOnly: state.config.pendingChangeId !== undefined,
