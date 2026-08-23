@@ -1,6 +1,6 @@
 import * as assert from 'node:assert/strict';
 import { spawn, spawnSync, type ChildProcess } from 'node:child_process';
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import * as vscode from 'vscode';
@@ -9,6 +9,7 @@ import { ApiClient } from '../api/client';
 import { ConfigService } from '../config';
 import { Logger } from '../log';
 import { AlertsTreeProvider, PendingAlertItem } from '../views/alertsTree';
+import { removeTree, stopProcess } from './support';
 
 /**
  * Phase 5's acceptance criterion: drop the stream mid-flight, and the client
@@ -39,6 +40,8 @@ suite('Event stream', function () {
   let notifier: RecordingNotifier;
   let startSequence: string;
   let services: AlertService[] = [];
+  /** Each holds a watch on the credential directory, so all are disposed before it goes. */
+  let configs: ConfigService[] = [];
 
   suiteSetup(async () => {
     const repoRoot = resolve(__dirname, '../../..');
@@ -60,8 +63,8 @@ suite('Event stream', function () {
   });
 
   suiteTeardown(async () => {
-    mock?.kill('SIGKILL');
-    rmSync(buildDir, { recursive: true, force: true, maxRetries: 20, retryDelay: 150 });
+    await stopProcess(mock);
+    removeTree(buildDir);
     for (const key of ['serverUrl', 'clientIdFilePath', 'tokenFilePath']) {
       await vscode.workspace.getConfiguration(SECTION).update(key, undefined, target);
     }
@@ -88,11 +91,21 @@ suite('Event stream', function () {
       service.dispose();
     }
     services = [];
+    for (const config of configs) {
+      config.dispose();
+    }
+    configs = [];
     tree.dispose();
     log.dispose();
-    rmSync(configDir, { recursive: true, force: true, maxRetries: 20, retryDelay: 150 });
+    removeTree(configDir);
     await clearServerAlerts();
   });
+
+  function credentials(): ConfigService {
+    const service = new ConfigService(memorySecretStorage(), log);
+    configs.push(service);
+    return service;
+  }
 
   function makeService(options: AlertServiceOptions = {}): AlertService {
     const service = new AlertService(
@@ -102,7 +115,7 @@ suite('Event stream', function () {
       new MemoryMemento({ 'acmeAlerts.lastSequence': startSequence }),
       log,
       tree,
-      new ConfigService(memorySecretStorage(), log),
+      credentials(),
       async () =>
         new ApiClient({
           baseUrl: BASE_URL,
@@ -216,7 +229,7 @@ suite('Event stream', function () {
       new MemoryMemento({ 'acmeAlerts.lastSequence': startSequence }),
       log,
       tree,
-      new ConfigService(memorySecretStorage(), log),
+      credentials(),
       async () =>
         new ApiClient({
           baseUrl: BASE_URL,

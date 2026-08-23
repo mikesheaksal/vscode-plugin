@@ -1,6 +1,6 @@
 import * as assert from 'node:assert/strict';
 import { spawn, spawnSync, type ChildProcess } from 'node:child_process';
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import * as vscode from 'vscode';
@@ -11,6 +11,7 @@ import { Logger } from '../log';
 import { MachineApplyService, type Confirmer } from '../machine/applyService';
 import { MachineConfigService } from '../machine/machineConfig';
 import { AlertsTreeProvider, PendingAlertItem, RecentFolder } from '../views/alertsTree';
+import { removeTree, stopProcess } from './support';
 
 /**
  * Phase 7's acceptance criteria: an answer given while offline arrives exactly
@@ -64,8 +65,8 @@ suite('Offline resilience', function () {
   });
 
   suiteTeardown(async () => {
-    mock?.kill('SIGKILL');
-    rmSync(buildDir, { recursive: true, force: true, maxRetries: 20, retryDelay: 150 });
+    await stopProcess(mock);
+    removeTree(buildDir);
     for (const key of ['serverUrl', 'clientIdFilePath', 'tokenFilePath']) {
       await vscode.workspace.getConfiguration(SECTION).update(key, undefined, target);
     }
@@ -95,7 +96,7 @@ suite('Offline resilience', function () {
     disposables = [];
     tree.dispose();
     log.dispose();
-    rmSync(configDir, { recursive: true, force: true, maxRetries: 20, retryDelay: 150 });
+    removeTree(configDir);
     await clearServerAlerts();
   });
 
@@ -112,11 +113,14 @@ suite('Offline resilience', function () {
   }
 
   function makeAlerts(store: vscode.Memento = memento): AlertService {
+    // Holds a watch on the credential directory, so it is disposed with the rest.
+    const credentials = new ConfigService(memorySecretStorage(), log);
+    disposables.push(credentials);
     const service = new AlertService(
       store,
       log,
       tree,
-      new ConfigService(memorySecretStorage(), log),
+      credentials,
       clientFor,
       notifier,
       { pollOnly: true, pollWaitSeconds: 1, minIntervalMs: 200, announceDebounceMs: 50 },

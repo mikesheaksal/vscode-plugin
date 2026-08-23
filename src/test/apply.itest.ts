@@ -1,6 +1,6 @@
 import * as assert from 'node:assert/strict';
 import { spawn, spawnSync, type ChildProcess } from 'node:child_process';
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import * as vscode from 'vscode';
@@ -9,6 +9,7 @@ import { NONE_GPU, type MachineSpec } from '../core/machineForm';
 import { Logger } from '../log';
 import { MachineApplyService, type Confirmer } from '../machine/applyService';
 import { MachineConfigService } from '../machine/machineConfig';
+import { removeTree, stopProcess } from './support';
 
 /**
  * Phase 6b's acceptance criteria against the real mock.
@@ -50,8 +51,8 @@ suite('Applying a machine configuration', function () {
   });
 
   suiteTeardown(async () => {
-    mock?.kill('SIGKILL');
-    rmSync(buildDir, { recursive: true, force: true, maxRetries: 20, retryDelay: 150 });
+    await stopProcess(mock);
+    removeTree(buildDir);
     for (const key of ['serverUrl', 'clientIdFilePath', 'tokenFilePath']) {
       await vscode.workspace.getConfiguration(SECTION).update(key, undefined, target);
     }
@@ -71,14 +72,14 @@ suite('Applying a machine configuration', function () {
     confirmer = new RecordingConfirmer();
   });
 
-  teardown(() => {
-    mock?.kill('SIGKILL');
+  teardown(async () => {
+    await stopProcess(mock);
     for (const disposable of disposables) {
       disposable.dispose();
     }
     disposables = [];
     log.dispose();
-    rmSync(configDir, { recursive: true, force: true, maxRetries: 20, retryDelay: 150 });
+    removeTree(configDir);
   });
 
   async function start(applyDelay = '0'): Promise<{

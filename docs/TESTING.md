@@ -31,6 +31,23 @@ Downloads VS Code on first run, so it needs network access to
 Everything is real except two surfaces a test cannot click, which are injected
 instead: the notification (`Notifier`) and the confirmation modal (`Confirmer`).
 
+Each suite builds the Go mock into its own temp directory and points the
+credential settings at another. Tearing those down is where Windows differs from
+the other two platforms, so `src/test/support.ts` holds the two rules that keep
+cleanup honest:
+
+- `stopProcess` waits for the mock to actually exit before its directory is
+  removed. `kill` only asks, and Windows keeps the executable mapped until the
+  process is gone.
+- `removeTree` reports and moves on if a directory will not go. Windows refuses
+  to delete a directory something is watching, and the activated extension
+  watches whichever credential directory the settings point at - no test can
+  reach into the extension host to dispose that watcher. Temp-directory
+  housekeeping is not an assertion, so it does not fail a green suite.
+
+Whatever a test does own, it disposes: a `ConfigService` a test constructs holds
+a directory watch, so it goes in the same teardown list as the service using it.
+
 ## What automation does not cover
 
 These need a person, and are worth walking before a release.

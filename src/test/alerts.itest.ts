@@ -1,6 +1,6 @@
 import * as assert from 'node:assert/strict';
 import { spawn, spawnSync, type ChildProcess } from 'node:child_process';
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import * as vscode from 'vscode';
@@ -9,6 +9,7 @@ import { ApiClient } from '../api/client';
 import { ConfigService } from '../config';
 import { Logger } from '../log';
 import { AlertsTreeProvider, PendingAlertItem, RecentFolder } from '../views/alertsTree';
+import { removeTree, stopProcess } from './support';
 
 /**
  * Phase 4's acceptance criterion, end to end: push an alert at the mock, and
@@ -38,6 +39,8 @@ suite('Alerts end to end', function () {
   let service: AlertService;
   let notifier: RecordingNotifier;
   let startSequence: string;
+  /** Holds a watch on the credential directory, so it is disposed before it goes. */
+  let credentials: ConfigService;
 
   suiteSetup(async () => {
     const repoRoot = resolve(__dirname, '../../..');
@@ -61,8 +64,8 @@ suite('Alerts end to end', function () {
   });
 
   suiteTeardown(async () => {
-    mock?.kill('SIGKILL');
-    rmSync(buildDir, { recursive: true, force: true, maxRetries: 20, retryDelay: 150 });
+    await stopProcess(mock);
+    removeTree(buildDir);
     for (const key of ['serverUrl', 'clientIdFilePath', 'tokenFilePath', 'apiToken']) {
       await vscode.workspace.getConfiguration(SECTION).update(key, undefined, target);
     }
@@ -82,6 +85,7 @@ suite('Alerts end to end', function () {
     log = new Logger('Acme Alerts Test');
     tree = new AlertsTreeProvider();
     notifier = new RecordingNotifier();
+    credentials = new ConfigService(memorySecretStorage(), log);
     service = new AlertService(
       // Seeded with the server's current sequence, so each test starts as a
       // client that is up to date rather than replaying every alert earlier
@@ -89,7 +93,7 @@ suite('Alerts end to end', function () {
       new MemoryMemento({ 'acmeAlerts.lastSequence': startSequence }),
       log,
       tree,
-      new ConfigService(memorySecretStorage(), log),
+      credentials,
       async () =>
         new ApiClient({
           baseUrl: BASE_URL,
@@ -106,9 +110,10 @@ suite('Alerts end to end', function () {
 
   teardown(async () => {
     service.dispose();
+    credentials.dispose();
     tree.dispose();
     log.dispose();
-    rmSync(configDir, { recursive: true, force: true, maxRetries: 20, retryDelay: 150 });
+    removeTree(configDir);
     await clearServerAlerts();
   });
 

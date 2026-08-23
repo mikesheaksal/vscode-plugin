@@ -1,11 +1,12 @@
 import * as assert from 'node:assert/strict';
-import { mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { mkdtemp, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import * as vscode from 'vscode';
 import { ConfigService } from '../config';
 import { Logger } from '../log';
 import { nodeFiles } from '../nodeFiles';
+import { removeTree } from './support';
 
 const SECTION = 'acmeAlerts';
 const SECRET_KEY = 'acmeAlerts.apiToken';
@@ -50,7 +51,7 @@ suite('ConfigService', () => {
     for (const key of ['serverUrl', 'clientIdFilePath', 'tokenFilePath', 'apiToken']) {
       await config().update(key, undefined, target);
     }
-    await rm(directory, { recursive: true, force: true, maxRetries: 20, retryDelay: 150 });
+    removeTree(directory);
   });
 
   test('reports no-server-url before anything is configured', async () => {

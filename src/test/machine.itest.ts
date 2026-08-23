@@ -1,6 +1,6 @@
 import * as assert from 'node:assert/strict';
 import { spawn, spawnSync, type ChildProcess } from 'node:child_process';
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import * as vscode from 'vscode';
@@ -8,6 +8,7 @@ import { ApiClient } from '../api/client';
 import { NONE_GPU, draftFromSpec, isChanged, validate } from '../core/machineForm';
 import { Logger } from '../log';
 import { MachineConfigService } from '../machine/machineConfig';
+import { removeTree, stopProcess } from './support';
 
 /**
  * Phase 6's acceptance criteria against the real mock.
@@ -51,8 +52,8 @@ suite('Machine configuration', function () {
   });
 
   suiteTeardown(async () => {
-    mock?.kill('SIGKILL');
-    rmSync(buildDir, { recursive: true, force: true, maxRetries: 20, retryDelay: 150 });
+    await stopProcess(mock);
+    removeTree(buildDir);
     for (const key of ['serverUrl', 'clientIdFilePath', 'tokenFilePath']) {
       await vscode.workspace.getConfiguration(SECTION).update(key, undefined, target);
     }
@@ -76,7 +77,7 @@ suite('Machine configuration', function () {
     }
     services = [];
     log.dispose();
-    rmSync(configDir, { recursive: true, force: true, maxRetries: 20, retryDelay: 150 });
+    removeTree(configDir);
   });
 
   function makeService(
@@ -231,8 +232,7 @@ suite('Machine configuration', function () {
 
   test('a pending change makes the form read-only', async () => {
     // Restarted with a delay so a change stays APPLYING long enough to observe.
-    mock.kill('SIGKILL');
-    await new Promise((r) => setTimeout(r, 300));
+    await stopProcess(mock);
     mock = startMock(binary, '--apply-delay=10s');
     await waitForServer();
 
@@ -259,8 +259,7 @@ suite('Machine configuration', function () {
       assert.ok(state.config.pendingChangeId, 'expected a pending change id');
     }
 
-    mock.kill('SIGKILL');
-    await new Promise((r) => setTimeout(r, 300));
+    await stopProcess(mock);
     mock = startMock(binary);
     await waitForServer();
   });
