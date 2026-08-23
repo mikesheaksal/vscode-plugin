@@ -1,7 +1,9 @@
 import * as vscode from 'vscode';
 import { AlertService } from './alerts/alertService';
 import { ApiClient } from './api/client';
+import { checkClientVersion } from './clientInfo';
 import { ConfigService } from './config';
+import { reportIssue } from './diagnostics';
 import { Logger } from './log';
 import { MachineApplyService } from './machine/applyService';
 import { MachineConfigService } from './machine/machineConfig';
@@ -74,6 +76,9 @@ export function activate(context: vscode.ExtensionContext): void {
     vscode.commands.registerCommand('acmeAlerts.showMachine', () => machine.reveal()),
     vscode.commands.registerCommand('acmeAlerts.openInEditor', () => machine.openInEditor()),
     vscode.commands.registerCommand('acmeAlerts.showLog', () => log.show()),
+    vscode.commands.registerCommand('acmeAlerts.reportIssue', () =>
+      reportIssue(context, config, machineConfig, log),
+    ),
     vscode.commands.registerCommand('acmeAlerts.openSettings', () =>
       vscode.commands.executeCommand('workbench.action.openSettings', '@ext:acme.acme-alerts'),
     ),
@@ -101,7 +106,13 @@ export function activate(context: vscode.ExtensionContext): void {
     config.onDidChange(() => void restart(alerts, config, state, log)),
   );
 
-  void restart(alerts, config, state, log);
+  void restart(alerts, config, state, log).then(async () => {
+    // Once per session, and never blocking activation.
+    const client = await clientFor();
+    if (client) {
+      await checkClientVersion(client, version, log);
+    }
+  });
 }
 
 export function deactivate(): void {

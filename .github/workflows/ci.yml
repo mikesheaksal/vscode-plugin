@@ -7,7 +7,13 @@ on:
 
 jobs:
   extension:
-    runs-on: ubuntu-latest
+    # The credential paths, the filesystem watcher and the mock's process
+    # handling all differ per platform, so all three are built and tested.
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -43,13 +49,25 @@ jobs:
         run: make breaking
 
   integration:
-    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
           node-version: '22'
           cache: npm
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.24'
       - run: npm ci
-      # The extension host needs a display, and downloads VS Code on first run.
-      - run: xvfb-run -a npm run test:integration
+      # The integration suite starts the Go mock, so it needs a real build.
+      - run: npm run build
+      # Linux has no display; the extension host needs one.
+      - if: runner.os == 'Linux'
+        run: xvfb-run -a npm run test:integration
+      - if: runner.os != 'Linux'
+        run: npm run test:integration

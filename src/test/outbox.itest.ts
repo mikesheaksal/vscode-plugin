@@ -47,7 +47,8 @@ suite('Offline resilience', function () {
   suiteSetup(async () => {
     const repoRoot = resolve(__dirname, '../../..');
     buildDir = mkdtempSync(join(tmpdir(), 'acme-mock-'));
-    const binary = join(buildDir, 'mock');
+    // Go does not add .exe when -o names the output, so the test must.
+    const binary = join(buildDir, process.platform === 'win32' ? 'mock.exe' : 'mock');
     const built = spawnSync('go', ['build', '-o', binary, './mock'], {
       cwd: repoRoot,
       encoding: 'utf8',

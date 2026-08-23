@@ -10,9 +10,18 @@ export type LogLevel = 'debug' | 'info' | 'warn' | 'error';
  * Register a secret once (§6.2 of the design) and every later line is scrubbed,
  * including ones written by code that has no idea a secret exists.
  */
+/** How many recent lines the Report Issue command can include. */
+const HISTORY_LIMIT = 200;
+
 export class Logger implements vscode.Disposable {
   private readonly channel: vscode.LogOutputChannel;
   private readonly secrets = new Set<string>();
+  /**
+   * A ring of recent lines, already redacted, so a diagnostics report can be
+   * assembled without the user copying an output panel by hand — and without
+   * any path that could reach an unredacted line.
+   */
+  private readonly history: string[] = [];
 
   constructor(name: string) {
     this.channel = vscode.window.createOutputChannel(name, { log: true });
@@ -53,8 +62,17 @@ export class Logger implements vscode.Disposable {
     this.channel.dispose();
   }
 
+  /** The most recent lines, oldest first. Already redacted. */
+  recent(limit = HISTORY_LIMIT): string[] {
+    return this.history.slice(-limit);
+  }
+
   private write(level: LogLevel, message: string, args: unknown[]): void {
     const line = this.redact([message, ...args.map(formatArg)].join(' '));
+    this.history.push(`[${level}] ${line}`);
+    if (this.history.length > HISTORY_LIMIT) {
+      this.history.splice(0, this.history.length - HISTORY_LIMIT);
+    }
     switch (level) {
       case 'debug':
         this.channel.debug(line);

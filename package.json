@@ -116,6 +116,11 @@
         "title": "Open in Editor",
         "category": "Acme Alerts",
         "icon": "$(link-external)"
+      },
+      {
+        "command": "acmeAlerts.reportIssue",
+        "title": "Report Issue",
+        "category": "Acme Alerts"
       }
     ],
     "menus": {
@@ -224,5 +229,6 @@
   "repository": {
     "type": "git",
     "url": "https://github.com/mikesheaksal/vscode-plugin.git"
-  }
+  },
+  "icon": "media/icon.png"
 }

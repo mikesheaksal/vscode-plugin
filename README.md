@@ -65,6 +65,23 @@ building the mock needs only Go. The googleapis imports are vendored under
 because the buf.build registry is not reachable from every environment this
 repo builds in.
 
+## Installing
+
+The extension is distributed as a `.vsix` file rather than through a
+marketplace, so it does not auto-update.
+
+```bash
+code --install-extension acme-alerts-0.1.0.vsix
+```
+
+Or in VS Code: Extensions view → `⋯` → **Install from VSIX**, then reload.
+
+Because nothing updates itself, the server reports the oldest client version it
+accepts. An install behind that gets one warning naming the version needed —
+ask whoever distributes the `.vsix` for a newer one.
+
+Build a `.vsix` yourself with `npm run package`.
+
 ## Development
 
 ```bash
