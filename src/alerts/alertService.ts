@@ -24,6 +24,16 @@ import {
   type AlertSeverity,
   type AlertStoreState,
 } from '../core/alertStore';
+import {
+  EMPTY_OUTBOX,
+  due as dueEntries,
+  enqueue,
+  isQueued,
+  prune,
+  remove,
+  reschedule,
+  type OutboxState,
+} from '../core/outbox';
 import type { Logger } from '../log';
 import type { AlertsTreeProvider } from '../views/alertsTree';
 
@@ -56,6 +66,8 @@ export const vscodeNotifier: Notifier = {
 
 const STATE_KEY = 'acmeAlerts.alerts';
 const SEQUENCE_KEY = 'acmeAlerts.lastSequence';
+const OUTBOX_KEY = 'acmeAlerts.outbox';
+const FLUSH_INTERVAL_MS = 60_000;
 const MIN_BACKOFF_MS = 1_000;
 const MAX_BACKOFF_MS = 60_000;
 
@@ -110,6 +122,9 @@ export class AlertService implements vscode.Disposable {
   private readonly announceQueue: AlertRecord[] = [];
   private announceTimer: ReturnType<typeof setTimeout> | undefined;
   private readonly announceDebounceMs: number;
+  private outbox: OutboxState;
+  private flushTimer: ReturnType<typeof setInterval> | undefined;
+  private flushing = false;
   /** Set after a 401 so a bad token produces one prompt, not a prompt per poll. */
   private reauthAttempted = false;
 
@@ -129,6 +144,7 @@ export class AlertService implements vscode.Disposable {
     this.announceDebounceMs = options.announceDebounceMs ?? 300;
     // Stored as a string: JSON has no bigint, and uint64 does not fit a number.
     this.lastSequence = BigInt(this.memento.get<string>(SEQUENCE_KEY) ?? '0');
+    this.outbox = this.memento.get<OutboxState>(OUTBOX_KEY) ?? EMPTY_OUTBOX;
   }
 
   /**
@@ -139,7 +155,7 @@ export class AlertService implements vscode.Disposable {
    * things away without reading them (design section 7.4).
    */
   async start(): Promise<void> {
-    this.tree.update(this.state);
+    this.tree.update(this.state, new Set(this.outbox.entries.map((entry) => entry.alertId)));
 
     const outstanding = this.state.pending.length;
     if (outstanding > 0) {
@@ -154,6 +170,10 @@ export class AlertService implements vscode.Disposable {
       }
       void this.showSummary(outstanding);
     }
+
+    // Answers left queued by a previous session go out before anything else:
+    // the user made those decisions, possibly days ago.
+    await this.flushOutbox();
 
     if (this.running) {
       return;
@@ -184,6 +204,10 @@ export class AlertService implements vscode.Disposable {
   stop(): void {
     this.running = false;
     this.polling = false;
+    if (this.flushTimer !== undefined) {
+      clearInterval(this.flushTimer);
+      this.flushTimer = undefined;
+    }
     if (this.announceTimer !== undefined) {
       clearTimeout(this.announceTimer);
       this.announceTimer = undefined;
@@ -256,6 +280,7 @@ export class AlertService implements vscode.Disposable {
       // every (re)connect: anything answered or withdrawn during an outage is
       // absent from this list even though no event announced it.
       this.polling = false;
+      await this.flushOutbox();
       await this.catchUp();
       return;
     }
@@ -504,24 +529,131 @@ export class AlertService implements vscode.Disposable {
   // -------------------------------------------------------------------------
 
   private async respond(alert: AlertRecord, buttonId: string, label: string): Promise<void> {
+    // Generated once for the user's action and reused by every retry, so an
+    // ambiguous failure replays as the same answer rather than a second one.
+    const idempotencyKey = crypto.randomUUID();
     const client = await this.clientFor();
-    if (!client) {
-      return;
+
+    if (client) {
+      try {
+        await client.respondToAlert({
+          alertId: alert.alertId,
+          outcome: AlertOutcome.ANSWERED,
+          buttonId,
+          idempotencyKey,
+        });
+        this.state = markAnswered(this.state, alert.alertId, label);
+        await this.persist();
+        this.log.info(`Answered ${alert.alertId} with ${buttonId}`);
+        // A successful send is evidence the network is back, so anything
+        // waiting goes now rather than on the next timer.
+        await this.flushOutbox();
+        return;
+      } catch (error) {
+        if (!isTransient(error)) {
+          await this.handleResponseError(alert, error);
+          return;
+        }
+        this.log.warn(`Queued answer for ${alert.alertId}: ${describeError(error)}`);
+      }
     }
 
-    try {
-      await client.respondToAlert({
-        alertId: alert.alertId,
-        outcome: AlertOutcome.ANSWERED,
-        buttonId,
-        idempotencyKey: crypto.randomUUID(),
-      });
-      this.state = markAnswered(this.state, alert.alertId, label);
-      await this.persist();
-      this.log.info(`Answered ${alert.alertId} with ${buttonId}`);
-    } catch (error) {
-      await this.handleResponseError(alert, error);
+    // The user decided; the network did not cooperate. Record the decision
+    // locally and keep the send for later.
+    this.outbox = enqueue(this.outbox, {
+      id: crypto.randomUUID(),
+      alertId: alert.alertId,
+      buttonId,
+      chosenLabel: label,
+      respondedAt: new Date().toISOString(),
+      idempotencyKey,
+    });
+    this.state = markAnswered(this.state, alert.alertId, label);
+    await this.persist();
+    this.scheduleFlush();
+    void vscode.window.setStatusBarMessage('Acme Alerts: answer will be sent when reconnected', 4000);
+  }
+
+  /** True while any answer is waiting to be sent. */
+  get hasQueuedAnswers(): boolean {
+    return this.outbox.entries.length > 0;
+  }
+
+  isQueued(alertId: string): boolean {
+    return isQueued(this.outbox, alertId);
+  }
+
+  /**
+   * Sends whatever is due.
+   *
+   * Runs on activation, on every stream reconnect, after any successful send,
+   * and on a timer while the queue is non-empty.
+   */
+  async flushOutbox(): Promise<void> {
+    if (this.flushing) {
+      return;
     }
+    this.flushing = true;
+    try {
+      const pruned = prune(this.outbox);
+      for (const dropped of pruned.dropped) {
+        // Never silent: an answer disappearing without a word is worse than
+        // one that never sent.
+        this.log.warn(
+          `Discarded a queued answer for ${dropped.alertId} after ${MAX_AGE_DAYS} days`,
+        );
+      }
+      this.outbox = pruned.state;
+
+      const client = await this.clientFor();
+      if (!client) {
+        await this.persistOutbox();
+        return;
+      }
+
+      for (const entry of dueEntries(this.outbox)) {
+        try {
+          await client.respondToAlert({
+            alertId: entry.alertId,
+            outcome: AlertOutcome.ANSWERED,
+            buttonId: entry.buttonId,
+            idempotencyKey: entry.idempotencyKey,
+          });
+          this.outbox = remove(this.outbox, entry.id);
+          this.log.info(`Sent queued answer for ${entry.alertId}`);
+          this.tree.update(this.state, new Set(this.outbox.entries.map((e) => e.alertId)));
+        } catch (error) {
+          if (isTransient(error)) {
+            this.outbox = reschedule(this.outbox, entry.id);
+            this.log.debug(`Queued answer for ${entry.alertId} still failing`);
+            break;
+          }
+          // The server has an opinion: already answered, withdrawn, or
+          // rejected. Retrying will not change it.
+          this.outbox = remove(this.outbox, entry.id);
+          this.log.info(`Dropped queued answer for ${entry.alertId}: ${describeError(error)}`);
+        }
+      }
+
+      await this.persistOutbox();
+      if (this.outbox.entries.length === 0 && this.flushTimer !== undefined) {
+        clearInterval(this.flushTimer);
+        this.flushTimer = undefined;
+      }
+    } finally {
+      this.flushing = false;
+    }
+  }
+
+  private scheduleFlush(): void {
+    if (this.flushTimer !== undefined) {
+      return;
+    }
+    this.flushTimer = setInterval(() => void this.flushOutbox(), FLUSH_INTERVAL_MS);
+  }
+
+  private async persistOutbox(): Promise<void> {
+    await this.memento.update(OUTBOX_KEY, this.outbox);
   }
 
   private async reportDismissal(alert: AlertRecord): Promise<void> {
@@ -581,8 +713,9 @@ export class AlertService implements vscode.Disposable {
   }
 
   private async persist(): Promise<void> {
-    this.tree.update(this.state);
+    this.tree.update(this.state, new Set(this.outbox.entries.map((entry) => entry.alertId)));
     await this.memento.update(STATE_KEY, this.state);
+    await this.persistOutbox();
   }
 }
 
@@ -621,6 +754,20 @@ function nextBackoff(current: number): number {
   const doubled = Math.min(current * 2, MAX_BACKOFF_MS);
   const jitter = doubled * 0.2 * (Math.random() * 2 - 1);
   return Math.round(doubled + jitter);
+}
+
+const MAX_AGE_DAYS = 7;
+
+/** Worth retrying: the request never reached a server that had an opinion. */
+function isTransient(error: unknown): boolean {
+  if (error instanceof NetworkError) {
+    return true;
+  }
+  return error instanceof ApiError && error.disposition === 'retry';
+}
+
+function describeError(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
 }
 
 function delay(ms: number): Promise<void> {

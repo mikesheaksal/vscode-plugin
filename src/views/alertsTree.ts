@@ -11,6 +11,8 @@ import { EMPTY_STATE } from '../core/alertStore';
  */
 export class AlertsTreeProvider implements vscode.TreeDataProvider<AlertsNode> {
   private state: AlertStoreState = EMPTY_STATE;
+  /** Answers recorded locally but not yet accepted by the server. */
+  private queued: ReadonlySet<string> = new Set();
   private view: vscode.TreeView<AlertsNode> | undefined;
 
   private readonly emitter = new vscode.EventEmitter<AlertsNode | undefined>();
@@ -24,8 +26,9 @@ export class AlertsTreeProvider implements vscode.TreeDataProvider<AlertsNode> {
     return this.view;
   }
 
-  update(state: AlertStoreState): void {
+  update(state: AlertStoreState, queuedAlertIds: ReadonlySet<string> = new Set()): void {
     this.state = state;
+    this.queued = queuedAlertIds;
     this.emitter.fire(undefined);
     this.updateBadge(state.pending.length);
   }
@@ -45,7 +48,9 @@ export class AlertsTreeProvider implements vscode.TreeDataProvider<AlertsNode> {
       return nodes;
     }
     if (node instanceof RecentFolder) {
-      return this.state.recent.map((entry) => new AnsweredAlertItem(entry));
+      return this.state.recent.map(
+        (entry) => new AnsweredAlertItem(entry, this.queued.has(entry.alert.alertId)),
+      );
     }
     return [];
   }
@@ -112,12 +117,16 @@ export class RecentFolder extends vscode.TreeItem {
 }
 
 export class AnsweredAlertItem extends vscode.TreeItem {
-  constructor(entry: AnsweredAlert) {
+  constructor(entry: AnsweredAlert, queued = false) {
     super(entry.alert.title || entry.alert.message, vscode.TreeItemCollapsibleState.None);
     this.id = `recent:${entry.alert.alertId}`;
-    this.description =
-      entry.outcome === 'revoked' ? 'withdrawn' : (entry.chosenLabel ?? 'answered');
-    this.iconPath = new vscode.ThemeIcon(entry.outcome === 'revoked' ? 'circle-slash' : 'check');
+    const answer = entry.outcome === 'revoked' ? 'withdrawn' : (entry.chosenLabel ?? 'answered');
+    // The user's decision is recorded either way; saying it is still going out
+    // is more honest than a tick that implies the server has it.
+    this.description = queued ? `${answer} · sending…` : answer;
+    this.iconPath = new vscode.ThemeIcon(
+      entry.outcome === 'revoked' ? 'circle-slash' : queued ? 'cloud-upload' : 'check',
+    );
     this.tooltip = new vscode.MarkdownString(
       `${escapeMarkdown(entry.alert.message)}\n\n_${entry.outcome} ${entry.answeredAt}_`,
     );

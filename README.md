@@ -36,6 +36,20 @@ curl -X POST localhost:8080/admin/alerts/alt_1/revoke?reason=withdrawn
 client's applying state and cancellation window are observable. The `/admin`
 endpoints are the mock's own, not part of the contract.
 
+## Offline behaviour
+
+Answering an alert while the server is unreachable records the decision locally
+and queues the send; it goes out on the next successful request, stream
+reconnect, extension start, or the 60-second flush timer, carrying the original
+idempotency key so it lands exactly once. Queued answers show as
+"… · sending…" in the Alerts view.
+
+Machine configuration applies are deliberately **not** queued. Replaying a
+reconfiguration minutes later, once the network returns and the user has moved
+on, is the opposite of what durable retry is for — a failed apply fails
+visibly, the edits stay in the form, and retrying is a fresh deliberate action
+with a fresh confirmation.
+
 ## Working on the contract
 
 ```bash

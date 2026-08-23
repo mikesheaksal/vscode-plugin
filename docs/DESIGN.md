@@ -792,10 +792,25 @@ hatch if field count grows.
 **Alert responses** are user intent that must not evaporate because the network blipped,
 so they go through a durable queue in `globalState`:
 
-- Each entry: `{ id, kind, url, body, idempotencyKey, attempts, nextAttemptAt }`.
+- Each entry is a **typed alert answer**, not a generic queued request:
+  `{ id, alertId, buttonId, chosenLabel, respondedAt, idempotencyKey, attempts, nextAttemptAt }`.
+  Applies are excluded by design (below) and dismissals by judgement — a dismissal is a
+  courtesy to the server rather than the user's decision, and queueing them would fill the
+  outbox with things nobody is waiting on. That leaves exactly one kind of entry, so a
+  generic url-and-body shape would buy nothing and lose type safety.
+- **One queued answer per alert.** Answering twice replaces the first rather than racing
+  both to the server.
 - Flushed on: successful send of anything else, stream reconnect, extension activation, and a
   60s timer while non-empty.
-- Bounded at 100 entries and 7 days; older entries are dropped with a log line.
+- Bounded at 100 entries and 7 days; the cap drops the *oldest*, since a fresh answer
+  matters more than one that has been failing for a week. Expiry is logged rather than
+  silent: an answer disappearing without a word is worse than one that never sent.
+- **The user's decision is recorded locally either way.** The alert leaves the pending
+  list and appears under Recent as "Approve · sending…" with an upload icon, so the view
+  never implies the server has something it does not.
+- **A refusal removes the entry.** `FAILED_PRECONDITION`, `ABORTED` and `INVALID_ARGUMENT`
+  mean the server has an opinion; retrying cannot change it. Only a network failure or a
+  transient status keeps an entry queued.
 - Because every entry carries an idempotency key, replaying after an ambiguous failure is
   safe.
 
